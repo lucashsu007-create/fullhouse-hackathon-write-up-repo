@@ -30,8 +30,9 @@ This avoids the main failure mode in noisy poker-bot competitions: overfitting t
 ---
 
 ## Current Version: V4.1 Classifier-Retuned Baseline
-
+V4.1 reads opponents, but strategy remains SafeTAG + Equity.
 The current frozen baseline is:
 
 ```text
 bots/v4_1_classifier_retuned.py
+

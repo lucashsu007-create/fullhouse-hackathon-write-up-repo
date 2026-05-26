@@ -1,0 +1,111 @@
+
+6-max live reads of v4_baseline.py (V4 classifier)
+table: hero + 5 custom bots, fresh stacks each hand, up to 1000 hands
+checkpoints: [50, 100, 200, 500, 1000]
+
+================ checkpoint: 50 hands ================
+  opponent               top_impl     p top_behav     p  conf   lam     n  foldB  callB  allin  buckets c/m/e (called/faced)
+  calling_station     calling_bot  1.00  unknown  0.52  0.27  0.00    12   0.00   1.00   0.00  0/0  10/10  0/0
+  nit_folder          folding_bot  1.00      nit  0.71  0.42  0.00    18   0.89   0.00   0.00  0/1  2/17  0/0
+  perma_jam          perma_all_in  1.00   maniac  1.00  0.72  0.36    29   0.00   0.15   0.83  1/1  24/24  2/2
+  simple_tag          folding_bot  1.00      nit  1.00  0.87  0.73    35   1.00   0.00   0.00  0/1  0/12  0/22
+  mc_pot_odds          simple_tag  0.56      nit  0.97  0.64  0.36    46   0.80   0.20   0.00  1/1  5/20  3/23
+
+================ checkpoint: 100 hands ================
+  opponent               top_impl     p top_behav     p  conf   lam     n  foldB  callB  allin  buckets c/m/e (called/faced)
+  calling_station     calling_bot  1.00  station  0.92  0.57  0.08    23   0.00   1.00   0.00  0/0  20/20  0/0
+  nit_folder          folding_bot  1.00      nit  1.00  0.87  0.73    35   0.94   0.00   0.00  0/2  2/33  0/0
+  perma_jam          perma_all_in  1.00   maniac  1.00  1.00  1.00    57   0.00   0.15   0.84  3/3  48/48  2/2
+  simple_tag          folding_bot  1.00      nit  1.00  1.00  1.00    67   0.97   0.00   0.03  0/3  0/21  2/43
+  mc_pot_odds          rule_shark  0.75      nit  0.98  0.80  1.00    88   0.84   0.16   0.00  2/3  6/40  6/43
+
+================ checkpoint: 200 hands ================
+  opponent               top_impl     p top_behav     p  conf   lam     n  foldB  callB  allin  buckets c/m/e (called/faced)
+  calling_station     calling_bot  1.00  station  1.00  1.00  1.00    47   0.00   1.00   0.00  0/0  38/38  0/0
+  nit_folder           rule_shark  0.91      nit  1.00  0.93  1.00    70   0.96   0.00   0.00  1/3  2/67  0/0
+  perma_jam          perma_all_in  1.00   maniac  1.00  1.00  1.00   114   0.00   0.15   0.83  3/3  100/100  2/2
+  simple_tag          folding_bot  1.00      nit  1.00  1.00  1.00   135   0.97   0.00   0.03  0/6  0/43  4/86
+  mc_pot_odds          rule_shark  0.93      nit  0.98  0.94  1.00   176   0.83   0.17   0.00  4/6  12/80  14/86
+
+================ checkpoint: 500 hands ================
+  opponent               top_impl     p top_behav     p  conf   lam     n  foldB  callB  allin  buckets c/m/e (called/faced)
+  calling_station     calling_bot  1.00  station  1.00  1.00  1.00   114   0.00   1.00   0.00  0/0  96/96  0/0
+  nit_folder          folding_bot  1.00      nit  1.00  1.00  1.00   176   0.95   0.00   0.00  1/7  7/169  0/0
+  perma_jam          perma_all_in  1.00   maniac  1.00  1.00  1.00   282   0.00   0.13   0.86  11/11  248/248  4/4
+  simple_tag          folding_bot  1.00      nit  1.00  1.00  1.00   337   0.95   0.00   0.04  0/14  4/102  14/221
+  mc_pot_odds          rule_shark  0.95      nit  0.96  0.95  1.00   434   0.79   0.21   0.00  7/13  34/196  47/216
+
+================ checkpoint: 1000 hands ================
+  opponent               top_impl     p top_behav     p  conf   lam     n  foldB  callB  allin  buckets c/m/e (called/faced)
+  calling_station     calling_bot  1.00  station  1.00  1.00  1.00   226   0.00   1.00   0.00  0/0  198/198  0/0
+  nit_folder          folding_bot  1.00      nit  1.00  1.00  1.00   358   0.96   0.00   0.00  1/10  15/348  0/0
+  perma_jam          perma_all_in  1.00   maniac  1.00  1.00  1.00   559   0.00   0.12   0.87  22/22  502/502  7/7
+  simple_tag          folding_bot  1.00      nit  1.00  1.00  1.00   682   0.94   0.00   0.04  1/25  12/205  29/452
+  mc_pot_odds          rule_shark  0.95      nit  0.97  0.95  1.00   873   0.80   0.20   0.00  14/23  62/393  98/441
+
+================ SUMMARY: expected vs observed ================
+  opponent         expected                     observed@final    conf   lam  verdict
+  calling_station  calling_bot / station        calling_bot       1.00  1.00  OK
+  nit_folder       folding_bot / nit            folding_bot       1.00  1.00  OK
+  perma_jam        perma_all_in / maniac        perma_all_in      1.00  1.00  OK
+  simple_tag       simple_tag / tag             folding_bot       1.00  1.00  MISCLASS
+  mc_pot_odds      monte_carlo / (station-like) rule_shark        0.95  1.00  MISCLASS
+
+Note: hero is collection-only; no decision was influenced by these reads (no strategy change).
+
+================================================================================
+BEFORE / AFTER — classifier retune (hero strategy UNCHANGED; classifier only)
+================================================================================
+
+                    BEFORE retune (raw fold dominates)   AFTER retune
+opponent            impl@1000      conf  lam               impl@1000      conf  lam   verdict
+------------------  -------------  ----  ---               -------------  ----  ---   -------
+calling_station     calling_bot    1.00  0.00              calling_bot    1.00  1.00  OK (unchanged)
+nit_folder          folding_bot    1.00  1.00              folding_bot    1.00  1.00  OK (unchanged)
+perma_jam           perma_all_in   1.00  1.00              perma_all_in   1.00  1.00  OK (unchanged)
+simple_tag          folding_bot    1.00  1.00              folding_bot    1.00  1.00  see note
+mc_pot_odds         folding_bot    1.00  1.00              rule_shark     0.95  1.00  FIXED (out of folding_bot)
+
+WHAT THE RETUNE DID
+-------------------
+1. Down-weighted fold_vs_bet (signal weight 1.0 -> 0.4) so raw fold rate no
+   longer dominates the posterior.
+2. Added a 9th signal: the bucket GRADIENT = P(a call landed on a cheap bet |
+   it called facing cheap-or-expensive). Price-sensitive bots (monte_carlo/TAG)
+   score high here; flat folders/stations do not. Weighted 1.6 (highest).
+3. Post-softmax folding_bot guard: if the opponent still calls CHEAP or MEDIUM
+   bets at a non-trivial rate, strip 95% of folding_bot mass and redistribute to
+   the price-sensitive types (monte_carlo / simple_tag / rule_shark).
+4. folding_bot confidence capped at 0.60 unless bucket evidence confirms
+   overfolding across ALL sizes (low cheap AND medium call rates) on >=8 faced
+   bets — so folding_bot can no longer reach ~1.00 on raw fold rate alone.
+
+RESULT vs the stated goal ("prevent simple_tag and mc_pot_odds from being
+classified as high-confidence folding_bot"):
+  * mc_pot_odds: FIXED. No longer folding_bot — now rule_shark (a TAG/value
+    family read whose prescribed exploit is "respect aggression", NOT the
+    dangerous anti-folder steal/barrel). The harmful misread is eliminated.
+  * simple_tag: STILL folding_bot — but NOT due to the raw-fold-rate artifact
+    the task targeted. Its observed bucket data is cheap 1/25 (4%), medium
+    12/205 (6%), expensive 29/452 (6%): it folds to bets at EVERY size, cheap
+    included. The guard intentionally does NOT rescue this, because the data
+    genuinely shows overfolding across all sizes. In other words, THIS custom
+    simple_tag bot behaves like a folder in 6-max (it only continues postflop
+    with strong made hands), so the classifier is reading real behavior, not a
+    weighting bug. Forcing it to read "simple_tag" would require hardcoding the
+    bot name (explicitly disallowed) or ignoring true bucket evidence.
+
+VERIFICATION (no regressions):
+  * Synthetic archetypes: 5/5 still classify correctly after retune.
+  * A genuine overfolder (cheap call rate 2/18) still reads folding_bot @ 1.00 —
+    the guard does not break true-folder detection.
+  * decide / _safetag / sizing / equity / update_stats: byte-for-byte UNCHANGED
+    (no strategy, action-selection, or SafeTAG change).
+  * No custom bot names referenced in the classifier ("simple_tag" appears only
+    as an archetype LABEL, which predates this task).
+
+TAKEAWAY: the raw-fold-rate domination is fixed (mc_pot_odds escaped folding_bot;
+folding_bot can't hit 1.00 without all-size bucket evidence). simple_tag's
+remaining folding_bot read reflects that the custom simple_tag bot actually
+overfolds at this table — a property of that test bot, not a classifier defect.
+================================================================================

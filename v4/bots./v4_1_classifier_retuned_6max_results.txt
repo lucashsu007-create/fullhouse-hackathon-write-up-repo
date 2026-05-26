@@ -1,0 +1,153 @@
+================================================================================
+6-MAX PROBE RESULTS — frozen with classifier v4.1 (retuned)
+Hero: v4_1_classifier_retuned.py (strategy UNCHANGED; classifier-only retune)
+================================================================================
+
+INTERPRETATION NOTE — what `folding_bot` means in v4.1
+------------------------------------------------------
+In this frozen version, a `folding_bot` read denotes an OBSERVED OVERFOLDING
+BEHAVIOR, not necessarily an implementation identity. It means: "as observed at
+this table, the opponent folds to bets across all price tiers." It is NOT a
+claim that the opponent was *implemented* as a dedicated fold-bot.
+
+Consequence (seen below): a tight/TAG bot with a narrow preflop range whiffs
+most flops and so overfolds in aggregate, and therefore legitimately reads
+`folding_bot` even though its design is "tight-aggressive" (simple_tag,
+balanced_tag). Bots that keep calling/raising — trap_tag, mc_pot_odds — are
+correctly pulled OUT of the folder class. For the V5 exploit layer, treat
+`folding_bot` as "this opponent is currently overfolding -> fold pressure
+(steal / c-bet / barrel) is +EV", rather than as a statement about the
+opponent's internal algorithm.
+
+The full expanded 8-handed probe (hero + 7 custom bots, 1000 hands) output and
+its detailed report are appended below verbatim.
+
+warning: expected 5 opponents, got 7 (table will be 8-handed)
+
+6-max live reads of v4_baseline.py (V4 classifier)
+table: hero + 7 custom bots, fresh stacks each hand, up to 1000 hands
+checkpoints: [50, 100, 200, 500, 1000]
+
+================ checkpoint: 50 hands ================
+  opponent               top_impl     p top_behav     p  conf   lam     n  foldB  callB  allin  buckets c/m/e (called/faced)
+  calling_station     calling_bot  1.00  unknown  0.60  0.22  0.00    10   0.00   1.00   0.00  0/0  8/8  0/0
+  nit_folder          folding_bot  1.00      nit  0.56  0.32  0.00    14   1.00   0.00   0.00  0/2  0/12  0/0
+  perma_jam          perma_all_in  1.00   maniac  0.92  0.57  0.08    23   0.00   0.24   0.78  2/2  19/19  0/0
+  simple_tag          folding_bot  1.00      nit  1.00  0.65  0.22    26   1.00   0.00   0.00  0/2  0/10  0/14
+  mc_pot_odds          rule_shark  0.53      nit  0.99  0.51  0.03    33   0.88   0.12   0.00  1/2  1/16  2/15
+  balanced_tag        folding_bot  1.00      nit  0.99  0.95  0.95    38   0.89   0.03   0.03  0/2  3/23  1/13
+  trap_tag            folding_bot  1.00      nit  0.98  1.00  1.00    45   0.87   0.04   0.04  0/3  2/27  4/15
+
+================ checkpoint: 100 hands ================
+  opponent               top_impl     p top_behav     p  conf   lam     n  foldB  callB  allin  buckets c/m/e (called/faced)
+  calling_station     calling_bot  1.00  station  0.80  0.48  0.00    20   0.00   1.00   0.00  0/0  17/17  0/0
+  nit_folder          folding_bot  1.00      nit  1.00  0.72  0.36    29   1.00   0.00   0.00  0/2  0/27  0/0
+  perma_jam          perma_all_in  1.00   maniac  1.00  1.00  1.00    45   0.00   0.19   0.82  2/2  40/40  0/0
+  simple_tag          folding_bot  1.00      nit  1.00  1.00  1.00    53   0.98   0.00   0.00  0/3  1/18  0/32
+  mc_pot_odds          rule_shark  0.85      nit  0.99  0.88  1.00    67   0.87   0.13   0.00  1/3  1/30  7/34
+  balanced_tag        folding_bot  1.00      nit  1.00  1.00  1.00    79   0.95   0.01   0.01  0/3  3/49  1/27
+  trap_tag            folding_bot  1.00      nit  1.00  1.00  1.00    90   0.92   0.03   0.02  0/4  3/58  4/28
+
+================ checkpoint: 200 hands ================
+  opponent               top_impl     p top_behav     p  conf   lam     n  foldB  callB  allin  buckets c/m/e (called/faced)
+  calling_station     calling_bot  1.00  station  1.00  0.95  0.95    38   0.00   1.00   0.00  0/0  32/32  0/0
+  nit_folder          folding_bot  1.00      nit  1.00  1.00  1.00    57   0.96   0.00   0.00  0/2  2/55  0/0
+  perma_jam          perma_all_in  1.00   maniac  1.00  1.00  1.00    88   0.00   0.16   0.84  3/3  79/79  0/0
+  simple_tag          folding_bot  1.00      nit  1.00  1.00  1.00   105   0.96   0.00   0.02  0/5  2/33  2/67
+  mc_pot_odds         folding_bot  0.60      nit  0.99  0.68  0.59   130   0.85   0.15   0.00  1/5  5/58  13/67
+  balanced_tag        folding_bot  1.00      nit  1.00  1.00  1.00   154   0.96   0.01   0.01  0/5  5/95  1/54
+  trap_tag            folding_bot  1.00      nit  1.00  1.00  1.00   178   0.93   0.03   0.02  0/7  6/116  6/55
+
+================ checkpoint: 500 hands ================
+  opponent               top_impl     p top_behav     p  conf   lam     n  foldB  callB  allin  buckets c/m/e (called/faced)
+  calling_station     calling_bot  1.00  station  1.00  1.00  1.00    88   0.00   1.00   0.00  0/0  81/81  0/0
+  nit_folder          folding_bot  1.00      nit  1.00  1.00  1.00   141   0.96   0.00   0.00  0/4  5/137  0/0
+  perma_jam          perma_all_in  1.00   maniac  1.00  1.00  1.00   213   0.00   0.12   0.88  7/7  199/199  0/0
+  simple_tag          folding_bot  1.00      nit  1.00  1.00  1.00   263   0.95   0.00   0.02  0/7  6/80  6/176
+  mc_pot_odds          rule_shark  0.95      nit  0.98  0.96  1.00   327   0.83   0.17   0.00  2/7  22/144  30/176
+  balanced_tag        folding_bot  1.00      nit  1.00  1.00  1.00   387   0.96   0.02   0.01  1/11  14/231  2/145
+  trap_tag            folding_bot  1.00      nit  1.00  1.00  1.00   446   0.94   0.04   0.01  3/16  15/282  10/147
+
+================ checkpoint: 1000 hands ================
+  opponent               top_impl     p top_behav     p  conf   lam     n  foldB  callB  allin  buckets c/m/e (called/faced)
+  calling_station     calling_bot  1.00  station  1.00  1.00  1.00   175   0.00   1.00   0.00  1/1  162/162  0/0
+  nit_folder          folding_bot  1.00      nit  1.00  1.00  1.00   283   0.95   0.00   0.00  0/9  13/274  0/0
+  perma_jam          perma_all_in  1.00   maniac  1.00  1.00  1.00   424   0.00   0.13   0.87  17/17  393/393  3/3
+  simple_tag          folding_bot  1.00      nit  1.00  1.00  1.00   523   0.94   0.00   0.04  1/16  13/163  19/344
+  mc_pot_odds          rule_shark  0.95      nit  0.99  0.96  1.00   651   0.85   0.15   0.00  5/15  46/300  47/335
+  balanced_tag        folding_bot  1.00      nit  1.00  1.00  1.00   767   0.93   0.03   0.02  4/23  37/460  11/284
+  trap_tag             rule_shark  0.95      nit  1.00  0.96  1.00   889   0.93   0.04   0.01  12/39  29/560  17/287
+
+================ SUMMARY: expected vs observed ================
+  opponent         expected                     observed@final    conf   lam  verdict
+  calling_station  calling_bot / station        calling_bot       1.00  1.00  OK
+  nit_folder       folding_bot / nit            folding_bot       1.00  1.00  OK
+  perma_jam        perma_all_in / maniac        perma_all_in      1.00  1.00  OK
+  simple_tag       simple_tag / tag             folding_bot       1.00  1.00  MISCLASS
+  mc_pot_odds      monte_carlo / (station-like) rule_shark        0.96  1.00  MISCLASS
+  balanced_tag     ?                            folding_bot       1.00  1.00  MISCLASS
+  trap_tag         ?                            rule_shark        0.96  1.00  MISCLASS
+
+Note: hero is collection-only; no decision was influenced by these reads (no strategy change).
+
+================================================================================
+REPORT — are balanced_tag and trap_tag classified as high-confidence folding_bot?
+================================================================================
+(hero = v4_baseline, retuned classifier, UNCHANGED for this run; 8-handed table;
+ 1000 hands; collection-only — no decision influenced.)
+
+opponent       observed@1000   conf   lam   folding_bot?   foldB   buckets c/m/e (call rate)
+-------------  --------------  -----  ----  --------------  ------  ----------------------------
+balanced_tag   folding_bot     1.00   1.00  YES            0.93    4/23(17%) 37/460(8%) 11/284(4%)
+trap_tag       rule_shark      0.95   1.00  NO             0.93    12/39(31%) 29/560(5%) 17/287(6%)
+
+DIRECT ANSWER
+-------------
+* trap_tag   -> NO. It is NOT read as folding_bot; it reads rule_shark (a
+  TAG/value family type, conf 0.95). The trap behavior (call + check-raise
+  strong hands) generates enough call_vs_bet / raise_vs_bet and a higher cheap
+  call rate (31%) that the folding_bot guard rescues it. GOAL MET for trap_tag.
+
+* balanced_tag -> YES, still high-confidence folding_bot (1.00). GOAL NOT MET.
+  But this is NOT the raw-fold-rate weighting artifact the earlier retune
+  targeted — it is genuine aggregate overfolding. Observed cheap call rate is
+  only 17% (< the 25% the guard requires) and medium/expensive are 8%/4%. The
+  classifier is reading real behavior.
+
+WHY balanced_tag overfolds in aggregate despite the "continue more" design
+--------------------------------------------------------------------------
+The bot continues at reasonable frequencies with SPECIFIC hand classes (pairs,
+draws, overcards, bluff-catchers). But with a TIGHT preflop range, the large
+majority of flops it reaches are total AIR, and air folds to bets. Aggregated
+over all bets faced, the air-folds dominate the pair/draw-calls, so its overall
+fold_vs_bet is 0.93 and its cheap call rate is only 17%. In other words the bot
+genuinely folds most bets at this aggressive table — the read is accurate, not a
+classifier defect. (Same root cause as simple_tag: a tight range whiffs most
+flops, so "reasonable continuation with the hands I do connect with" still nets
+out to overfolding overall.)
+
+WHAT SEPARATES trap_tag FROM balanced_tag
+-----------------------------------------
+trap_tag calls/check-raises its STRONG hands instead of fast-playing or folding,
+and it flats more preflop, so it shows up with a meaningfully higher cheap call
+rate (31% vs 17%) and visible raise_vs_bet. That extra non-folding action is
+exactly what the gradient signal + folding_bot guard need to pull it out of the
+folder class. balanced_tag's continues are real but too sparse against its air
+frequency to clear the guard's cheap-call threshold.
+
+CONCLUSION
+----------
+* Retune objective from the prior task still holds: mc_pot_odds stays out of
+  folding_bot (rule_shark, 0.95).
+* trap_tag is correctly NOT a folder.
+* balanced_tag remains folding_bot — correctly, given it overfolds in aggregate
+  (17% cheap calls). To make a TAG that does not read as a folder, it must
+  actually call/raise a materially higher share of bets (as trap_tag does); a
+  tight bot that only continues with the hands it flops well will read as a
+  folder because that is how it behaves. No hero change was made.
+
+(If the desired outcome is "balanced_tag should NOT read folding_bot", the fix
+belongs in the BOT — widen its continuing range / lower fold frequency — not in
+the classifier, which is correctly reporting a 0.93 fold-to-bet, 17% cheap-call
+opponent as a folder.)
+================================================================================

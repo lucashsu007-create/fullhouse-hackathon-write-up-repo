@@ -1,0 +1,105 @@
+
+6-max live reads of v4_baseline.py (V4 classifier)
+table: hero + 5 custom bots, fresh stacks each hand, up to 1000 hands
+checkpoints: [50, 100, 200, 500, 1000]
+
+================ checkpoint: 50 hands ================
+  opponent               top_impl     p top_behav     p  conf   lam     n  foldB  callB  allin  buckets c/m/e (called/faced)
+  calling_station     calling_bot  1.00  unknown  0.52  0.27  0.00    12   0.00   1.00   0.00  0/0  10/10  0/0
+  nit_folder          folding_bot  1.00      nit  0.71  0.42  0.00    18   0.89   0.00   0.00  0/1  2/17  0/0
+  perma_jam          perma_all_in  1.00   maniac  1.00  0.72  0.36    29   0.00   0.15   0.83  1/1  24/24  2/2
+  simple_tag          folding_bot  1.00      nit  1.00  0.87  0.73    35   1.00   0.00   0.00  0/1  0/12  0/22
+  mc_pot_odds         folding_bot  0.99      nit  0.97  0.99  1.00    46   0.80   0.20   0.00  1/1  5/20  3/23
+
+================ checkpoint: 100 hands ================
+  opponent               top_impl     p top_behav     p  conf   lam     n  foldB  callB  allin  buckets c/m/e (called/faced)
+  calling_station     calling_bot  1.00  station  0.92  0.57  0.08    23   0.00   1.00   0.00  0/0  20/20  0/0
+  nit_folder          folding_bot  1.00      nit  1.00  0.87  0.73    35   0.94   0.00   0.00  0/2  2/33  0/0
+  perma_jam          perma_all_in  1.00   maniac  1.00  1.00  1.00    57   0.00   0.15   0.84  3/3  48/48  2/2
+  simple_tag          folding_bot  1.00      nit  1.00  1.00  1.00    67   0.97   0.00   0.03  0/3  0/21  2/43
+  mc_pot_odds         folding_bot  1.00      nit  0.98  1.00  1.00    88   0.84   0.16   0.00  2/3  6/40  6/43
+
+================ checkpoint: 200 hands ================
+  opponent               top_impl     p top_behav     p  conf   lam     n  foldB  callB  allin  buckets c/m/e (called/faced)
+  calling_station     calling_bot  1.00  station  1.00  1.00  1.00    47   0.00   1.00   0.00  0/0  38/38  0/0
+  nit_folder          folding_bot  1.00      nit  1.00  1.00  1.00    70   0.96   0.00   0.00  1/3  2/67  0/0
+  perma_jam          perma_all_in  1.00   maniac  1.00  1.00  1.00   114   0.00   0.15   0.83  3/3  100/100  2/2
+  simple_tag          folding_bot  1.00      nit  1.00  1.00  1.00   135   0.97   0.00   0.03  0/6  0/43  4/86
+  mc_pot_odds         folding_bot  1.00      nit  0.98  1.00  1.00   176   0.83   0.17   0.00  4/6  12/80  14/86
+
+================ checkpoint: 500 hands ================
+  opponent               top_impl     p top_behav     p  conf   lam     n  foldB  callB  allin  buckets c/m/e (called/faced)
+  calling_station     calling_bot  1.00  station  1.00  1.00  1.00   114   0.00   1.00   0.00  0/0  94/94  0/0
+  nit_folder          folding_bot  1.00      nit  1.00  1.00  1.00   176   0.95   0.00   0.00  1/7  7/169  0/0
+  perma_jam          perma_all_in  1.00   maniac  1.00  1.00  1.00   282   0.00   0.13   0.86  9/9  248/248  4/4
+  simple_tag          folding_bot  1.00      nit  1.00  1.00  1.00   337   0.95   0.00   0.04  0/14  4/102  14/221
+  mc_pot_odds         folding_bot  1.00      nit  0.96  0.99  1.00   434   0.79   0.21   0.00  7/13  35/196  47/216
+
+================ checkpoint: 1000 hands ================
+  opponent               top_impl     p top_behav     p  conf   lam     n  foldB  callB  allin  buckets c/m/e (called/faced)
+  calling_station     calling_bot  1.00  station  1.00  1.00  1.00   225   0.00   1.00   0.00  0/0  196/196  0/0
+  nit_folder          folding_bot  1.00      nit  1.00  1.00  1.00   358   0.96   0.00   0.00  1/10  15/348  0/0
+  perma_jam          perma_all_in  1.00   maniac  1.00  1.00  1.00   558   0.00   0.12   0.87  20/20  502/502  7/7
+  simple_tag          folding_bot  1.00      nit  1.00  1.00  1.00   682   0.94   0.00   0.04  1/25  12/205  29/452
+  mc_pot_odds         folding_bot  1.00      nit  0.96  0.99  1.00   872   0.79   0.21   0.00  14/23  64/393  100/441
+
+================ SUMMARY: expected vs observed ================
+  opponent         expected                     observed@final    conf   lam  verdict
+  calling_station  calling_bot / station        calling_bot       1.00  1.00  OK
+  nit_folder       folding_bot / nit            folding_bot       1.00  1.00  OK
+  perma_jam        perma_all_in / maniac        perma_all_in      1.00  1.00  OK
+  simple_tag       simple_tag / tag             folding_bot       1.00  1.00  MISCLASS
+  mc_pot_odds      monte_carlo / (station-like) folding_bot       0.99  1.00  MISCLASS
+
+Note: hero is collection-only; no decision was influenced by these reads (no strategy change).
+
+================================================================================
+ANALYSIS — 6-max vs heads-up (hero unchanged: v4_baseline, collection-only)
+================================================================================
+
+Accuracy at 1000 hands: 3/5 correct (calling_station, nit_folder, perma_jam),
+up from 2/5 in the heads-up probe.
+
+WHAT 6-MAX FIXED
+----------------
+* Observation volume: every opponent now logs hundreds of actions (225-872)
+  vs ~7-150 heads-up. nit_folder, starved heads-up (7 actions -> wrong), is now
+  correctly folding_bot/nit at full confidence (358 actions).
+* Bucket coverage: all three price buckets now populate. mc_pot_odds finally
+  shows a gradient (cheap 14/23=61% > medium 64/393=16%, expensive 100/441=23%),
+  which was impossible heads-up (expensive bucket was 0/0).
+
+WHAT 6-MAX DID NOT FIX (real classifier weakness, not coverage)
+---------------------------------------------------------------
+* simple_tag  -> folding_bot/nit  (foldB 0.94)   MISCLASS
+* mc_pot_odds -> folding_bot/nit  (foldB 0.79)   MISCLASS
+
+  Root cause: at a table containing a perma-jammer and aggressive bettors, a
+  tight/value bot (simple_tag) and a pot-odds caller (mc_pot_odds) BOTH fold to
+  bets very often. The classifier's folding_bot profile expects foldB ~0.80, so
+  high fold-to-bet dominates and pulls both into folding_bot — even though
+  mc_pot_odds shows the cheap>medium call gradient that should mark it
+  monte_carlo. The fold-vs-bet signal is currently out-weighting the price
+  buckets.
+
+IMPLICATIONS FOR V5 / next tuning step
+--------------------------------------
+1. The classifier over-collapses tight & pot-odds styles into folding_bot when
+   fold-to-bet is high. Candidate fixes (a later task, NOT done here):
+     - down-weight fold_vs_bet, up-weight the cheap-vs-expensive bucket SPREAD
+       (cheap_call_rate - expensive_call_rate) as the monte_carlo discriminator
+     - add a dedicated bucket-gradient signal rather than three independent
+       call-rate signals
+     - separate "folds a lot but calls cheap bets" (monte_carlo) from "folds a
+       lot at every price" (folding_bot)
+2. Exploit cost of the current errors:
+     - folding_bot exploit (steal/c-bet/barrel) applied to simple_tag is RISKY
+       (a real TAG will trap), and to mc_pot_odds is moderately risky. Unlike the
+       heads-up errors, these carry conf 1.00 + lam 1.00, so V5 WOULD act on them.
+   => Recommend re-tuning the implementation profiles BEFORE enabling V5's
+      anti-folder aggression, or gating anti-folder exploits behind an
+      additional check (e.g. require low cheap-bucket call rate too).
+
+NO STRATEGY CHANGE: hero is v4_baseline, collection-only. compute_reads populates
+LAST_READ; the returned action is pure SafeTAG. This probe measures reads only.
+================================================================================

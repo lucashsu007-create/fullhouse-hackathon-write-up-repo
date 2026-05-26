@@ -23,9 +23,7 @@ The current system combines:
 
 The core philosophy is:
 
-\[
-\textbf{safe baseline first, exploit only when evidence is strong}
-\]
+safe baseline first, exploit only when evidence is strong
 
 This avoids the main failure mode in noisy poker-bot competitions: overfitting to a small custom opponent zoo or trusting high-variance backtest improvements.
 

@@ -1,9 +1,10 @@
-# fullhouse-hackathon-write-up-repo
 # Fullhouse Hackathon Poker Bot
 
 ## Project Overview
 
-This project builds an adaptive no-limit Texas Hold'em poker bot for the Fullhouse Hackathon. The goal is not to approximate full game-theoretic optimal poker. Instead, the bot is designed around a more practical competition objective:
+This project builds an adaptive no-limit Texas Hold'em poker bot for the Fullhouse Hackathon.
+
+The objective is not to approximate full game-theoretic optimal poker. Instead, the bot is designed around a practical competition goal:
 
 \[
 \max_\theta \mathbb{E}[\text{chip delta}]
@@ -23,16 +24,5 @@ The current system combines:
 
 The core philosophy is:
 
-safe baseline first, exploit only when evidence is strong
-
-This avoids the main failure mode in noisy poker-bot competitions: overfitting to a small custom opponent zoo or trusting high-variance backtest improvements.
-
----
-
-## Current Version: V4.1 Classifier-Retuned Baseline
-V4.1 reads opponents, but strategy remains SafeTAG + Equity.
-The current frozen baseline is:
-
 ```text
-bots/v4_1_classifier_retuned.py
-
+safe baseline first, exploit only when evidence is strong

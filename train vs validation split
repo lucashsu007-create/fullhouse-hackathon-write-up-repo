@@ -1,1 +1,11 @@
+**Train (tune against):**
+- nit, station, maniac — one variant each
+- balanced GTO bot
+- trap + level-2 reader — one variant each (to build the back-off and sizing-randomization mechanisms)
+- factory: a random sample of parameter points
 
+**Validation (never tune against):**
+- a twin of each target — nit, station, level-2 reader, trap — each with a *different* key parameter
+- MDF defender, NN policy, gear-shifter, CFR bot (if built) — pure oracles/stress-tests
+- factory: a disjoint random sample + the extreme corners you didn't train on
+Mechanism families (nit, station, trap, level-2) live in **both** — one instance in train, a different-parameter twin in validation. The oracles (MDF, NN, gear-shifter, CFR) and the factory's held-out region live in validation **only**.

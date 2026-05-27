@@ -6,11 +6,9 @@ This project builds an adaptive no-limit Texas Hold'em poker bot for the Fullhou
 
 The objective is not to approximate full game-theoretic optimal poker. Instead, the bot is designed around a practical competition goal:
 
-\[
-\max_\theta \mathbb{E}[\text{chip delta}]
-\]
-
-under strict runtime, sandbox, and implementation constraints.
+```text
+maximize expected chip delta
+```
 
 The current system combines:
 
@@ -22,9 +20,11 @@ The current system combines:
 - seeded EV backtesting,
 - paired A/B testing for strategy changes.
 
-The core philosophy is:
+Core philosophy:
 
-> Safe baseline first, exploit only when evidence is strong.
+```text
+Safe baseline first. Exploit only when evidence is strong.
+```
 
 This avoids a common failure mode in noisy poker-bot competitions: overfitting to a small custom opponent zoo or trusting high-variance backtest improvements.
 
@@ -34,11 +34,15 @@ This avoids a common failure mode in noisy poker-bot competitions: overfitting t
 
 The current frozen baseline is:
 
-`bots/v4_1_classifier_retuned.py`
+```text
+bots/v4_1_classifier_retuned.py
+```
 
 V4.1 reads opponents, but strategy remains:
 
-`SafeTAG + Equity`
+```text
+SafeTAG + Equity
+```
 
 That means the bot collects statistics, computes opponent reads, and stores classifier outputs, but does not yet alter decisions based on those reads.
 
@@ -50,46 +54,47 @@ This makes V4.1 a clean control bot for future V5 A/B tests.
 
 The current architecture is:
 
-- SafeTAG baseline
-- Monte Carlo equity engine
-- RAM-only opponent statistics
-- implementation classifier
-- behavior classifier
-- confidence / sample-size exploit gate
+```text
+SafeTAG baseline
+    +
+Monte Carlo equity engine
+    +
+RAM-only opponent statistics
+    +
+implementation classifier
+    +
+behavior classifier
+    +
+confidence / sample-size exploit gate
+```
 
 In V4.1:
 
-\[
-\text{Action}_{V4.1}
-=
-\text{SafeTAG}(\text{state}, \text{equity})
-\]
+```text
+V4.1 action = SafeTAG(state, equity)
+```
 
 while the read system separately computes:
 
-\[
-\text{Read}
-=
-(\text{top implementation},\ \text{top behavior},\ n,\ c,\ \lambda)
-\]
+```text
+Read = top implementation, top behavior, relevant sample size, confidence, exploit weight
+```
 
 where:
 
-- \(n\) is relevant sample size,
-- \(c\) is confidence,
-- \(\lambda\) is exploit weight.
+```text
+n      = relevant sample size
+c      = confidence
+lambda = exploit weight
+```
 
 The exploit weight is:
 
-\[
-\lambda
-=
-\min(1,n/60)
-\cdot
-\max(0,(c-0.50)/0.30)
-\]
+```text
+lambda = min(1, n / 60) * max(0, (c - 0.50) / 0.30)
+```
 
-In V4.1, \(\lambda\) is only recorded. In V5, it controls how much the bot is allowed to deviate from the baseline.
+In V4.1, `lambda` is only recorded. In V5, it controls how much the bot is allowed to deviate from the baseline.
 
 ---
 
@@ -101,11 +106,13 @@ The baseline strategy is deliberately conservative.
 
 Hands are classified into:
 
-- premium
-- strong
-- playable
-- speculative
-- trash
+```text
+premium
+strong
+playable
+speculative
+trash
+```
 
 The bot opens tighter from early position and wider from later position. Against normal raises, it continues with stronger ranges. Against committing all-ins, it uses an equity filter instead of relying only on a static range chart.
 
@@ -130,21 +137,25 @@ The bot reconstructs public action history and maintains RAM-only statistics for
 
 Tracked features include:
 
-- actions
-- VPIP / PFR proxies
-- true once-per-hand VPIP / PFR
-- fold vs bet
-- call vs bet
-- raise vs bet
-- all-in rate
-- street aggression
-- cheap / medium / expensive call frequencies
+```text
+actions
+VPIP / PFR proxies
+true once-per-hand VPIP / PFR
+fold vs bet
+call vs bet
+raise vs bet
+all-in rate
+street aggression
+cheap / medium / expensive call frequencies
+```
 
 The key price buckets are based on bet size relative to pot:
 
-- cheap: <= 1/3 pot
-- medium: 1/3 to 3/4 pot
-- expensive: > 3/4 pot
+```text
+cheap      <= 1/3 pot
+medium     1/3 to 3/4 pot
+expensive  > 3/4 pot
+```
 
 This matters because raw fold rate alone is not enough. A pot-odds bot may fold many expensive bets while still calling cheap ones. A true overfolder folds across all sizes.
 
@@ -162,19 +173,41 @@ The fix was a classifier retune, not a strategy change.
 
 1. Down-weighted raw `fold_vs_bet`.
 
-   `fold_vs_bet weight: 1.0 -> 0.4`
+```text
+fold_vs_bet weight: 1.0 -> 0.4
+```
 
 2. Added a bucket-gradient signal.
 
-   This distinguishes “folds because the price was bad” from “folds across all bet sizes.”
+This distinguishes:
+
+```text
+folds because the price was bad
+```
+
+from:
+
+```text
+folds across all bet sizes
+```
 
 3. Added a folding-bot evidence guard.
 
-   The `folding_bot` label cannot reach high confidence unless the opponent also shows low call rates against cheap and medium bets.
+The `folding_bot` label cannot reach high confidence unless the opponent also shows low call rates against cheap and medium bets.
 
 4. Reinterpreted `folding_bot`.
 
-   In V4.1, `folding_bot` does not mean “this opponent was coded as a fold bot.” It means “this opponent is observed to overfold at this table.”
+In V4.1, `folding_bot` does not mean:
+
+```text
+this opponent was coded as a fold bot
+```
+
+It means:
+
+```text
+this opponent is observed to overfold at this table
+```
 
 This is the correct interpretation for downstream exploit logic.
 
@@ -186,16 +219,20 @@ The classifier was tested against a custom opponent zoo.
 
 ### Original custom opponents
 
-- calling_station
-- nit_folder
-- perma_jam
-- simple_tag
-- mc_pot_odds
+```text
+calling_station
+nit_folder
+perma_jam
+simple_tag
+mc_pot_odds
+```
 
 ### Expanded probe opponents
 
-- balanced_tag
-- trap_tag
+```text
+balanced_tag
+trap_tag
+```
 
 Key results:
 
@@ -211,9 +248,9 @@ Key results:
 
 The important goal is not perfect bot-name classification. The goal is behaviorally useful leak detection.
 
-\[
-\text{correct leak detection} > \text{correct bot-name detection}
-\]
+```text
+correct leak detection > correct bot-name detection
+```
 
 ---
 
@@ -221,7 +258,9 @@ The important goal is not perfect bot-name classification. The goal is behaviora
 
 The project uses a custom in-process EV backtester:
 
-`backtest.py`
+```text
+backtest.py
+```
 
 It supports two modes.
 
@@ -229,20 +268,29 @@ It supports two modes.
 
 Measures one hero bot against a field:
 
-`python3 backtest.py eval HERO OPPONENT_1 OPPONENT_2 ... --matches 100 --hands 400`
+```bash
+python3 backtest.py eval HERO OPPONENT_1 OPPONENT_2 ... --matches 100 --hands 400
+```
 
 It reports:
 
-- mean chip delta per match,
-- 95% confidence interval,
-- bb/100,
-- win rate.
+```text
+mean chip delta per match
+95% confidence interval
+bb/100
+win rate
+```
 
 ### Paired A/B mode
 
 Compares two bot variants on identical seeds, seats, and opponent fields:
 
-`python3 backtest.py ab --a bots/candidate.py --b bots/v4_1_classifier_retuned.py --field bots/custom/perma_jam/bot.py ...`
+```bash
+python3 backtest.py ab \
+  --a bots/candidate.py \
+  --b bots/v4_1_classifier_retuned.py \
+  --field bots/custom/perma_jam/bot.py ...
+```
 
 This is the preferred method for deciding whether a strategy change is real.
 
@@ -256,13 +304,17 @@ After initial 100-match evaluations, V4.1 was re-tested with a larger baseline s
 
 Each field was tested with:
 
-- 500 matches
-- 400 hands per match
-- 200,000 hands per field
+```text
+500 matches
+400 hands per match
+200,000 hands per field
+```
 
 Across five fields:
 
-`5 fields × 500 matches × 400 hands = 1,000,000 simulated hands`
+```text
+5 fields * 500 matches * 400 hands = 1,000,000 simulated hands
+```
 
 All tests were run locally in WSL using real `eval7`.
 
@@ -271,14 +323,14 @@ All tests were run locally in WSL using real `eval7`.
 | Field | Composition | Purpose |
 |---|---|---|
 | Custom | calling_station, nit_folder, perma_jam, simple_tag, mc_pot_odds | General custom opponent zoo |
-| Aggro-heavy | 2× perma_jam, simple_tag, trap_tag, mc_pot_odds | Stress-test versus all-in / aggressive pools |
+| Aggro-heavy | 2x perma_jam, simple_tag, trap_tag, mc_pot_odds | Stress-test versus all-in / aggressive pools |
 | Reference | aggressor, mathematician, shark, ref_bot_2 | Generalization outside the custom zoo |
 | Tight-heavy | nit_folder, simple_tag, balanced_tag, trap_tag, mc_pot_odds | Stress-test versus tighter / more disciplined opponents |
-| Station-heavy | 3× calling_station, simple_tag, nit_folder | Value-extraction test versus calling-heavy pools |
+| Station-heavy | 3x calling_station, simple_tag, nit_folder | Value-extraction test versus calling-heavy pools |
 
 ### Results
 
-| Field | Mean Δ / match | 95% CI | bb/100 | Win rate | Verdict |
+| Field | Mean delta / match | 95% CI | bb/100 | Win rate | Verdict |
 |---|---:|---:|---:|---:|---|
 | Custom | +7108.7 | [+5511.8, +8705.7] | +17.77 | 54.4% | Strong positive |
 | Aggro-heavy | +7388.8 | [+5676.3, +9101.3] | +18.47 | 50.2% | Strong positive |
@@ -290,31 +342,31 @@ All tests were run locally in WSL using real `eval7`.
 
 The 500-match suite confirms that V4.1 is a statistically profitable baseline across all tested opponent pools.
 
-\[
-\text{V4.1 mean EV} > 0
-\]
+```text
+V4.1 mean EV > 0 in every tested field
+```
 
-in every tested field, with all 95% confidence intervals strictly above zero.
+All 95% confidence intervals are strictly above zero.
 
 The weakest field is tight-heavy:
 
-\[
-\text{tight-heavy} = +5.52 \text{ bb/100}
-\]
+```text
+tight-heavy = +5.52 bb/100
+```
 
 The strongest field is station-heavy:
 
-\[
-\text{station-heavy} = +27.44 \text{ bb/100}
-\]
+```text
+station-heavy = +27.44 bb/100
+```
 
 The reference field result is especially important:
 
-\[
-\text{reference} = +21.01 \text{ bb/100}
-\]
+```text
+reference = +21.01 bb/100, with 76.6% match win rate
+```
 
-with a 76.6% match win rate. This suggests that the bot is not only overfitting to the custom opponent zoo.
+This suggests that the bot is not only overfitting to the custom opponent zoo.
 
 ---
 
@@ -326,9 +378,9 @@ The goal of V5 is no longer to make the bot profitable. V4.1 already is profitab
 
 The goal is:
 
-\[
-\text{improve the weakest positive fields without damaging reference performance}
-\]
+```text
+improve the weakest positive fields without damaging reference performance
+```
 
 Every V5 module must be tested against V4.1 using paired A/B tests.
 
@@ -342,14 +394,31 @@ The current V5 candidates are isolated exploit modules built from V4.1.
 
 ### V5a: Anti-Perma-All-In
 
-File: `bots/v5a_antiperma.py`
+File:
 
-Purpose: avoid marginal stack-offs against detected perma-all-in opponents.
+```text
+bots/v5a_antiperma.py
+```
+
+Purpose:
+
+```text
+avoid marginal stack-offs against detected perma-all-in opponents
+```
 
 Trigger conditions:
 
-- `top_impl == "perma_all_in"` with high confidence, or
-- `actions >= 15`, `allins >= 4`, and `allins / actions > 0.25`.
+```text
+top_impl == "perma_all_in" with high confidence
+```
+
+or:
+
+```text
+actions >= 15
+allins >= 4
+allins / actions > 0.25
+```
 
 Allowed behavior changes:
 
@@ -369,15 +438,36 @@ Explicitly not added:
 
 ### V5b: Anti-Calling-Station
 
-File: `bots/v5b_antistation.py`
+File:
 
-Purpose: extract more value from opponents that call too much.
+```text
+bots/v5b_antistation.py
+```
+
+Purpose:
+
+```text
+extract more value from opponents that call too much
+```
 
 Trigger conditions:
 
-- `top_impl == "calling_bot"` with high confidence, or
-- `top_behav == "station"` with confidence >= 0.65, or
-- `faced_bet >= 20` and `call_vs_bet / faced_bet >= 0.65`.
+```text
+top_impl == "calling_bot" with high confidence
+```
+
+or:
+
+```text
+top_behav == "station" with confidence >= 0.65
+```
+
+or:
+
+```text
+faced_bet >= 20
+call_vs_bet / faced_bet >= 0.65
+```
 
 Allowed behavior changes:
 
@@ -397,16 +487,34 @@ Explicitly not added:
 
 ### V5c: Capped Anti-Overfolder
 
-File: `bots/v5c_antifolder_capped.py`
+File:
 
-Purpose: apply small, capped pressure against confirmed overfolders.
+```text
+bots/v5c_antifolder_capped.py
+```
+
+Purpose:
+
+```text
+apply small, capped pressure against confirmed overfolders
+```
 
 This is the most dangerous module because it adds aggression, so it is heavily gated.
 
 Trigger conditions:
 
-- `top_impl == "folding_bot"`, `confidence >= 0.70`, and `lambda > 0.3`, or
-- `faced_bet >= 25` and `fold_vs_bet / faced_bet >= 0.70`.
+```text
+top_impl == "folding_bot"
+confidence >= 0.70
+lambda > 0.3
+```
+
+or:
+
+```text
+faced_bet >= 25
+fold_vs_bet / faced_bet >= 0.70
+```
 
 Additional safety gates:
 
@@ -422,15 +530,15 @@ Additional safety gates:
 
 Bluff condition:
 
-\[
-f_{\text{needed}} = \frac{B}{P+B}
-\]
+```text
+fold_needed = bet_size / (pot + bet_size)
+```
 
 Only bluff if:
 
-\[
-\hat f_{\text{fold}} > f_{\text{needed}} + \text{safety margin}
-\]
+```text
+observed_fold_rate > fold_needed + safety_margin
+```
 
 Explicitly not added:
 
@@ -447,11 +555,11 @@ Each V5 module must be tested isolated against V4.1.
 
 Current first-stage target tests:
 
-| Module | Target field |
-|---|---|
-| V5a anti-perma | aggro-heavy field |
-| V5b anti-station | station-heavy field |
-| V5c anti-overfolder | tight-heavy field |
+```text
+V5a anti-perma      -> aggro-heavy field
+V5b anti-station    -> station-heavy field
+V5c anti-overfolder -> tight-heavy field
+```
 
 A module is not kept because it sounds strategically correct.
 
@@ -459,11 +567,22 @@ A module is kept only if the paired A/B test supports it.
 
 ### Keep / reject logic
 
-- Target CI positive: keep candidate for combination.
-- Target mean positive but CI crosses zero: retest at 300 matches.
-- Target negative: reject.
-- Reference CI negative: reject unless target gain is very large.
-- Custom CI negative: suspicious, retest or reject.
+```text
+Target CI positive:
+    keep candidate for combination
+
+Target mean positive but CI crosses zero:
+    retest at 300 matches
+
+Target negative:
+    reject
+
+Reference CI negative:
+    reject unless target gain is very large
+
+Custom CI negative:
+    suspicious, retest or reject
+```
 
 ### Candidate target A/B command
 
@@ -480,31 +599,39 @@ python3 backtest.py ab --a bots/v5c_antifolder_capped.py --b bots/v4_1_classifie
 
 The main custom opponent zoo:
 
-- `bots/custom/calling_station/bot.py`
-- `bots/custom/nit_folder/bot.py`
-- `bots/custom/perma_jam/bot.py`
-- `bots/custom/simple_tag/bot.py`
-- `bots/custom/mc_pot_odds/bot.py`
-- `bots/custom/balanced_tag/bot.py`
-- `bots/custom/trap_tag/bot.py`
+```text
+bots/custom/calling_station/bot.py
+bots/custom/nit_folder/bot.py
+bots/custom/perma_jam/bot.py
+bots/custom/simple_tag/bot.py
+bots/custom/mc_pot_odds/bot.py
+bots/custom/balanced_tag/bot.py
+bots/custom/trap_tag/bot.py
+```
 
 Reference bots:
 
-- `bots/aggressor/bot.py`
-- `bots/mathematician/bot.py`
-- `bots/shark/bot.py`
-- `bots/ref_bot_2/bot.py`
+```text
+bots/aggressor/bot.py
+bots/mathematician/bot.py
+bots/shark/bot.py
+bots/ref_bot_2/bot.py
+```
 
 Main hero and candidate files:
 
-- `bots/v4_1_classifier_retuned.py`
-- `bots/v5a_antiperma.py`
-- `bots/v5b_antistation.py`
-- `bots/v5c_antifolder_capped.py`
+```text
+bots/v4_1_classifier_retuned.py
+bots/v5a_antiperma.py
+bots/v5b_antistation.py
+bots/v5c_antifolder_capped.py
+```
 
 Backtest harness:
 
-- `backtest.py`
+```text
+backtest.py
+```
 
 ---
 
@@ -512,9 +639,11 @@ Backtest harness:
 
 Recommended environment:
 
-- Ubuntu / WSL
-- Python virtual environment
-- real `eval7` installed
+```text
+Ubuntu / WSL
+Python virtual environment
+real eval7 installed
+```
 
 Install:
 
@@ -541,7 +670,9 @@ PY
 
 Expected deck size:
 
-`52`
+```text
+52
+```
 
 Do not use EV results if `eval7` is missing or stubbed.
 
@@ -549,15 +680,17 @@ Do not use EV results if `eval7` is missing or stubbed.
 
 ## Current Project Status
 
-- V4.1 baseline: validated
-- Total baseline validation: 1,000,000 simulated hands
-- All fields: positive EV
-- Reference generalization: strong
-- Weakest field: tight-heavy
-- V5a: candidate, pending local A/B
-- V5b: candidate, pending local A/B
-- V5c: candidate, pending local A/B
-- Next step: isolated V5 A/B testing
+```text
+V4.1 baseline: validated
+Total baseline validation: 1,000,000 simulated hands
+All fields: positive EV
+Reference generalization: strong
+Weakest field: tight-heavy
+V5a: candidate, pending local A/B
+V5b: candidate, pending local A/B
+V5c: candidate, pending local A/B
+Next step: isolated V5 A/B testing
+```
 
 ---
 
@@ -565,26 +698,36 @@ Do not use EV results if `eval7` is missing or stubbed.
 
 Current stage:
 
-`V4.1 = profitable frozen baseline`
+```text
+V4.1 = profitable frozen baseline
+```
 
 Next stage:
 
-`test V5 candidates one by one`
+```text
+test V5 candidates one by one
+```
 
 Final stage:
 
-`combine only modules that pass A/B`
+```text
+combine only modules that pass A/B
+```
 
 The intended development path is:
 
-1. V4.1 baseline
-2. V5a anti-perma
-3. V5b anti-station
-4. V5c capped anti-overfolder
-5. combine only winners
-6. final validation
-7. submit safest positive-EV version
+```text
+V4.1 baseline
+    -> V5a anti-perma
+    -> V5b anti-station
+    -> V5c capped anti-overfolder
+    -> combine only winners
+    -> final validation
+    -> submit safest positive-EV version
+```
 
 The central rule remains:
 
-> Do not break the baseline.
+```text
+do not break the baseline
+```

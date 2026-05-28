@@ -9,11 +9,11 @@ Run from the directory that contains this file and backtest.py:
 This version does NOT depend on backtest.py exposing run_eval()/run_ab().
 It imports the building blocks that backtest.py defines —
     make_ids, build_decide_map, run_match_inproc, summarize
-— and performs the eval / paired-AB orchestration locally (see _run_eval /
-_run_ab below). That mirrors backtest.py's own cmd_eval / cmd_ab logic exactly,
-match-for-match, while also returning the richer result shape this dashboard's
-Results tab needs (per-match deltas, per-bot crash/timing counts) and threading
-a per-match progress callback.
+— and performs the eval / paired multi-hero orchestration locally (see _run_eval
+/ _run_multi below). That mirrors backtest.py's own cmd_eval / cmd_ab logic,
+match-for-match (generalising the A-vs-B path to 2–7 heroes), while also
+returning the richer result shape this dashboard's Results tab needs (per-match
+deltas, per-bot crash/timing counts) and threading a per-match progress callback.
 
 Two correctness fixes over the previous revision:
   1. Duplicate seats are preserved. A preset like
@@ -313,59 +313,88 @@ def _run_eval(hero_path, opponent_paths, matches, hands, seed_base,
     }
 
 
-def _run_ab(a_path, b_path, field_paths, matches, hands, seed_base,
-            budget, fold_on_timeout, progress_callback=None) -> dict:
-    """Paired A-vs-B on identical seeds, identical seat, identical (freshly
-    loaded) opponents. Mirrors backtest.cmd_ab. field_paths may contain
-    duplicates; they seat independently."""
+def _run_multi(hero_specs, baseline_id, field_paths, matches, hands, seed_base,
+               budget, fold_on_timeout, progress_callback=None) -> dict:
+    """Paired N-way comparison (2..7 heroes) on identical seeds, identical seat,
+    identical (freshly loaded) field. Generalises the old A-vs-B path: at each
+    match index every hero plays its OWN match against the same field, in the
+    same seat, on the same seed — so all heroes are mutually paired and each
+    variant's per-match delta lines up index-for-index with every other's.
+
+    hero_specs: list of {"id", "path"} (caller guarantees 2..7 unique ids).
+    baseline_id: the hero id everyone else is compared against (paired diff).
+
+    Note: the engine's 9-seat cap applies to field + 1 hero per sub-match, NOT
+    to the number of heroes — each hero is seated alone against the field."""
     field_ids = bt.make_ids(list(field_paths))
     field_map = dict(zip(field_ids, field_paths))
-    a_id = _hero_label("A:", a_path)
-    b_id = _hero_label("B:", b_path)
-    if a_id == b_id:
-        a_id, b_id = a_id + "#1", b_id + "#2"
     n_seats = len(field_ids) + 1
 
-    a_deltas, b_deltas, paired = [], [], []
+    # Seat label per hero. Ids are unique already; only disambiguate the rare
+    # case where a hero id collides with a generated field id.
+    hero_ids, hero_path = [], {}
+    field_set = set(field_ids)
+    for h in hero_specs:
+        hid = h["id"]
+        if hid in field_set or hid in hero_path:
+            hid = hid + "#h"
+        hero_ids.append(hid)
+        hero_path[hid] = h["path"]
+    if baseline_id not in hero_path:           # baseline got disambiguated too
+        baseline_id = hero_ids[0]
+
+    deltas = {hid: [] for hid in hero_ids}     # absolute chip Δ per match
     errors_total: dict = {}
     timing_total: dict = {}
 
     t0 = time.time()
     for i in range(matches):
         seed = seed_base + i
-        hero_idx = i % n_seats  # same seat for A and B at this seed
+        hero_idx = i % n_seats  # same seat for every hero at this seed
 
-        def seated(hid, hpath):
+        def seated(hid):
             order = field_ids[:]
             order.insert(hero_idx, hid)
-            paths = {bid: (hpath if bid == hid else field_map[bid])
+            paths = {bid: (hero_path[hid] if bid == hid else field_map[bid])
                      for bid in order}
             dm = bt.build_decide_map({b: paths[b] for b in order})
             return bt.run_match_inproc(dm, hands, seed, budget=budget,
                                        fold_on_timeout=fold_on_timeout)
 
-        ra = seated(a_id, a_path)
-        rb = seated(b_id, b_path)
-        _accumulate(errors_total, timing_total, ra)
-        _accumulate(errors_total, timing_total, rb)
-
-        a_deltas.append(ra["chip_delta"][a_id])
-        b_deltas.append(rb["chip_delta"][b_id])
-        paired.append(a_deltas[-1] - b_deltas[-1])
+        for hid in hero_ids:
+            res = seated(hid)
+            _accumulate(errors_total, timing_total, res)
+            deltas[hid].append(res["chip_delta"][hid])
 
         if progress_callback:
             progress_callback(i + 1, matches)
 
     elapsed = time.time() - t0
-    sa = bt.summarize(a_deltas, hands)
-    sb = bt.summarize(b_deltas, hands)
-    sd = bt.summarize(paired, hands)
-    t_stat = (sd["mean_delta"] / sd["stderr"]) if sd["stderr"] else 0.0
+
+    # Per-hero absolute stats.
+    stats = {hid: bt.summarize(deltas[hid], hands) for hid in hero_ids}
+
+    # Paired (hero - baseline) per match, for every non-baseline hero.
+    base_deltas = deltas[baseline_id]
+    paired = {}        # hid -> list of per-match (hid - baseline)
+    vs_baseline = {}   # hid -> {"stats": summarize(paired), "t_stat": ...}
+    for hid in hero_ids:
+        if hid == baseline_id:
+            continue
+        pd = [a - b for a, b in zip(deltas[hid], base_deltas)]
+        paired[hid] = pd
+        sd = bt.summarize(pd, hands)
+        t_stat = (sd["mean_delta"] / sd["stderr"]) if sd["stderr"] else 0.0
+        vs_baseline[hid] = {"stats": sd, "t_stat": t_stat}
+
     return {
         "elapsed_s": round(elapsed, 2),
-        "stats": {"A": sa, "B": sb, "A_minus_B": sd},
-        "t_stat": t_stat,
-        "per_match_deltas": {"A": a_deltas, "B": b_deltas, "A_minus_B": paired},
+        "baseline": baseline_id,
+        "hero_ids": hero_ids,
+        "stats": stats,                       # absolute, per hero
+        "vs_baseline": vs_baseline,           # paired diff vs baseline
+        "per_match_deltas": deltas,           # absolute, per hero
+        "per_match_paired": paired,           # (hero - baseline), per non-baseline hero
         "errors": errors_total,
         "timing": timing_total,
     }
@@ -521,12 +550,16 @@ def make_eval_job(label, hero, opponents, preset_name, params) -> dict:
     return job
 
 
-def make_ab_job(label, hero_a, hero_b, opponents, preset_name, params) -> dict:
+def make_ab_job(label, heroes, baseline, opponents, preset_name, params) -> dict:
+    """Paired comparison of 2..7 heroes against a shared field. `heroes` is a
+    list of {id, path}; `baseline` is the id everyone else is measured against."""
     if not label:
-        label = f"A:{hero_a['id']} vs B:{hero_b['id']} on {len(opponents)} field"
+        ids = ", ".join(h["id"] for h in heroes)
+        label = (f"{len(heroes)}-way: {ids} (base {baseline}) "
+                 f"on {len(opponents)} field")
     job = _base_job("ab", label, preset_name, params)
-    job["hero_a"] = hero_a
-    job["hero_b"] = hero_b
+    job["heroes"] = heroes
+    job["baseline"] = baseline
     job["opponents"] = opponents
     return job
 
@@ -569,9 +602,10 @@ def write_result_json(job, results_dir, result, error) -> Path:
     if job["mode"] == "eval":
         base["hero"] = job["hero"]
     elif job["mode"] == "ab":
-        base["hero_a"] = job["hero_a"]
-        base["hero_b"] = job["hero_b"]
-        base["t_stat"] = (result or {}).get("t_stat")
+        base["heroes"] = job["heroes"]
+        base["baseline"] = job["baseline"]
+        base["vs_baseline"] = (result or {}).get("vs_baseline")
+        base["per_match_paired"] = (result or {}).get("per_match_paired")
 
     out_path = Path(results_dir) / f"{job['job_id']}.json"
     out_path.write_text(json.dumps(out_path_safe(base), indent=2))
@@ -598,9 +632,9 @@ def run_job(job, results_dir, progress_callback=None) -> None:
                 progress_callback=progress_callback,
             )
         elif job["mode"] == "ab":
-            result = _run_ab(
-                a_path=job["hero_a"]["path"],
-                b_path=job["hero_b"]["path"],
+            result = _run_multi(
+                hero_specs=job["heroes"],
+                baseline_id=job["baseline"],
                 field_paths=[o["path"] for o in job["opponents"]],
                 matches=params["matches"],
                 hands=params["hands"],
@@ -812,24 +846,41 @@ with tab_run:
             horizontal=True,
             key="cfg_mode",
             format_func=lambda m: "eval (1 hero vs field)" if m == "eval"
-                                  else "ab (paired A vs B on same field)",
+                                  else "ab (paired comparison of 2–7 heroes)",
             help=("eval: one hero against a field, ranked by EV. "
-                  "ab: two hero variants on identical seeds + same seat per match, "
-                  "with paired t-stat on (A − B)."),
+                  "ab: 2–7 hero variants on identical seeds + same seat per match, "
+                  "each paired against a chosen baseline (paired t-stat)."),
         )
 
         # ----- Hero(es) -----
         if mode == "eval":
             hero_id = st.selectbox("Hero", options=bot_ids, key="cfg_hero")
-            hero_a_id = hero_b_id = None
+            hero_choices = []
+            baseline_id = None
             excluded_ids = {hero_id}
         else:
-            ab_col1, ab_col2 = st.columns(2)
-            hero_a_id = ab_col1.selectbox("Hero A", options=bot_ids, key="cfg_hero_a")
-            b_options = [b for b in bot_ids if b != hero_a_id] or bot_ids
-            hero_b_id = ab_col2.selectbox("Hero B", options=b_options, key="cfg_hero_b")
+            hero_choices = st.multiselect(
+                "Heroes (2–7) — compared head-to-head on identical paired matches",
+                options=bot_ids,
+                key="cfg_heroes",
+                help="Each hero plays its own match against the same field, in the "
+                     "same seat, on the same seed. The 9-seat engine cap applies to "
+                     "the field + 1 hero, so the number of heroes is unrestricted "
+                     "(capped at 7 here for sanity).",
+            )
+            if len(hero_choices) > 7:
+                st.warning("Pick at most 7 heroes. Extra selections will be ignored.")
+                hero_choices = hero_choices[:7]
+            baseline_id = (
+                st.selectbox(
+                    "Baseline (every other hero is measured against this one)",
+                    options=hero_choices,
+                    key="cfg_baseline",
+                )
+                if hero_choices else None
+            )
             hero_id = None
-            excluded_ids = {hero_a_id, hero_b_id}
+            excluded_ids = set(hero_choices)
 
         # ----- Field: preset (authoritative, dups preserved) OR manual -----
         preset_names = [""] + [p["name"] for p in presets]
@@ -919,7 +970,8 @@ with tab_run:
             key="cfg_label",
             placeholder=(f"e.g. {hero_id} vs {preset_choice or 'field'}"
                          if mode == "eval"
-                         else f"e.g. {hero_a_id} vs {hero_b_id} on {preset_choice or 'field'}"),
+                         else (f"e.g. {len(hero_choices)}-way on "
+                               f"{preset_choice or 'field'}")),
         )
 
         params = {
@@ -940,8 +992,8 @@ with tab_run:
             elif n_seats > MAX_SEATS:
                 st.error(f"{n_seats} seats exceeds the engine cap of {MAX_SEATS}. "
                          f"Trim to ≤{MAX_SEATS - 1} {opps_label.lower()}.")
-            elif mode == "ab" and hero_a_id == hero_b_id:
-                st.error("Hero A and Hero B must be different bots.")
+            elif mode == "ab" and len(hero_choices) < 2:
+                st.error("Pick at least 2 heroes to compare.")
             else:
                 opponents = [bot_by_id[b] for b in effective_field]  # dups kept
                 if mode == "eval":
@@ -955,8 +1007,8 @@ with tab_run:
                 else:
                     job = make_ab_job(
                         label=label or "",
-                        hero_a=bot_by_id[hero_a_id],
-                        hero_b=bot_by_id[hero_b_id],
+                        heroes=[bot_by_id[h] for h in hero_choices],
+                        baseline=baseline_id,
                         opponents=opponents,
                         preset_name=preset_choice or None,
                         params=params,
@@ -988,7 +1040,7 @@ with tab_run:
                 )
                 disabled = (
                     not sweep_choices
-                    or (mode == "ab" and hero_a_id == hero_b_id)
+                    or (mode == "ab" and len(hero_choices) < 2)
                 )
                 if st.button(
                     f"Queue sweep across {len(sweep_choices)} preset(s)",
@@ -1019,8 +1071,8 @@ with tab_run:
                         else:
                             j = make_ab_job(
                                 label=sweep_label,
-                                hero_a=bot_by_id[hero_a_id],
-                                hero_b=bot_by_id[hero_b_id],
+                                heroes=[bot_by_id[h] for h in hero_choices],
+                                baseline=baseline_id,
                                 opponents=opps, preset_name=pname, params=params,
                             )
                         st.session_state.queue.append(j)
@@ -1047,7 +1099,10 @@ with tab_run:
             if j["mode"] == "eval":
                 hero_repr = j["hero"]["id"]
             else:
-                hero_repr = f"A:{j['hero_a']['id']} vs B:{j['hero_b']['id']}"
+                hero_repr = " vs ".join(
+                    h["id"] + ("*" if h["id"] == j.get("baseline") else "")
+                    for h in j["heroes"]
+                ) + "  (* = baseline)"
             rows.append({
                 "mode": j["mode"],
                 "status": j["status"],
@@ -1228,7 +1283,23 @@ with tab_results:
                     hero_repr = (d.get("hero") or {}).get("id") or ""
                     opps_repr = ", ".join(o.get("id", "?") for o in (d.get("opponents") or []))
                     headline = None
-                else:
+                elif d.get("heroes"):                       # new multi-hero shape
+                    base = d.get("baseline") or "?"
+                    ids = [h.get("id", "?") for h in d["heroes"]]
+                    hero_repr = " vs ".join(
+                        (i + "*" if i == base else i) for i in ids
+                    )
+                    opps_repr = ", ".join(o.get("id", "?") for o in (d.get("opponents") or []))
+                    vb = d.get("vs_baseline") or {}
+                    best = max(
+                        ((hid, (v or {}).get("t_stat"))
+                         for hid, v in vb.items()
+                         if isinstance((v or {}).get("t_stat"), (int, float))),
+                        key=lambda kv: abs(kv[1]), default=None,
+                    )
+                    headline = (f"{best[0]} t={best[1]:+.2f} vs {base}"
+                                if best else f"base {base}")
+                else:                                       # legacy 2-hero ab
                     a = (d.get("hero_a") or {}).get("id") or "?"
                     b = (d.get("hero_b") or {}).get("id") or "?"
                     hero_repr = f"A:{a} vs B:{b}"
@@ -1285,6 +1356,9 @@ with tab_results:
                 }
                 if mode == "eval":
                     meta_payload["hero"] = data.get("hero")
+                elif data.get("heroes"):
+                    meta_payload["heroes"] = data.get("heroes")
+                    meta_payload["baseline"] = data.get("baseline")
                 else:
                     meta_payload["hero_a"] = data.get("hero_a")
                     meta_payload["hero_b"] = data.get("hero_b")
@@ -1320,7 +1394,63 @@ with tab_results:
                     st.markdown("**Per-bot stats**")
                     st.dataframe(rows, use_container_width=True, hide_index=True)
 
+                elif stats and mode == "ab" and data.get("heroes"):
+                    # New multi-hero paired comparison (2..7 heroes).
+                    baseline = data.get("baseline")
+                    vs_baseline = data.get("vs_baseline") or {}
+
+                    # 1) Absolute per-hero table.
+                    abs_rows = []
+                    for hid, s in stats.items():
+                        s = s or {}
+                        abs_rows.append({
+                            "hero": hid + ("  ← baseline" if hid == baseline else ""),
+                            "matches": s.get("matches"),
+                            "mean Δ/match": round(s.get("mean_delta") or 0.0, 1),
+                            "95% CI low": round(s.get("ci_low") or 0.0, 1),
+                            "95% CI high": round(s.get("ci_high") or 0.0, 1),
+                            "bb/100": round(s.get("bb_per_100") or 0.0, 2),
+                            "win%": round((s.get("win_rate") or 0.0) * 100, 1),
+                        })
+                    abs_rows.sort(key=lambda r: -r["mean Δ/match"])
+                    st.markdown("**Per-hero stats (absolute, vs the field)**")
+                    st.dataframe(abs_rows, use_container_width=True, hide_index=True)
+
+                    # 2) Paired difference vs baseline, with verdict per hero.
+                    st.markdown(f"**Paired difference vs baseline `{baseline}`**")
+                    diff_rows = []
+                    for hid, v in vs_baseline.items():
+                        s = (v or {}).get("stats") or {}
+                        t = (v or {}).get("t_stat")
+                        ci_low, ci_high = s.get("ci_low"), s.get("ci_high")
+                        if ci_low is not None and ci_low > 0:
+                            verdict = f"beats {baseline}"
+                        elif ci_high is not None and ci_high < 0:
+                            verdict = f"loses to {baseline}"
+                        else:
+                            verdict = "indistinguishable"
+                        sig = ("✓" if isinstance(t, (int, float)) and abs(t) >= 1.96
+                               else "")
+                        diff_rows.append({
+                            "hero − baseline": hid,
+                            "mean Δ/match": round(s.get("mean_delta") or 0.0, 1),
+                            "95% CI low": round(ci_low or 0.0, 1),
+                            "95% CI high": round(ci_high or 0.0, 1),
+                            "t-stat": round(t, 2) if isinstance(t, (int, float)) else None,
+                            "sig@95%": sig,
+                            "verdict": verdict,
+                        })
+                    diff_rows.sort(key=lambda r: -(r["mean Δ/match"]))
+                    if diff_rows:
+                        st.dataframe(diff_rows, use_container_width=True, hide_index=True)
+                        st.caption("Each row is the paired (hero − baseline) chip Δ on "
+                                   "identical seeds/seats. CI strictly above 0 ⇒ the "
+                                   "hero beats the baseline; ✓ marks |t| ≥ 1.96.")
+                    else:
+                        st.caption("No non-baseline heroes to compare.")
+
                 elif stats and mode == "ab":
+                    # Legacy 2-hero shape (hero_a / hero_b, stats A/B/A_minus_B).
                     a_id = (data.get("hero_a") or {}).get("id") or "A"
                     b_id = (data.get("hero_b") or {}).get("id") or "B"
                     ab_rows = []
@@ -1381,6 +1511,7 @@ with tab_results:
 
                 # --- Per-match delta histogram --------------------------------
                 pmd = data.get("per_match_deltas") or {}
+                paired_pmd = data.get("per_match_paired") or {}
                 if pmd:
                     st.markdown("**Per-match delta**")
                     if not _HAS_MPL:
@@ -1392,7 +1523,32 @@ with tab_results:
                             deltas = pmd.get(hero_id) or []
                             hist_title = f"Hero ({hero_id}) chip Δ per match"
                             xlabel = "chip delta per match"
+                        elif data.get("heroes"):
+                            # Let the user pick any hero's absolute series or any
+                            # paired (hero − baseline) series.
+                            baseline = data.get("baseline")
+                            opts = [f"{hid} (absolute)" for hid in pmd.keys()]
+                            opts += [f"{hid} − {baseline} (paired)"
+                                     for hid in paired_pmd.keys()]
+                            default_idx = (len(pmd) if paired_pmd else 0)
+                            choice = st.selectbox(
+                                "Series to histogram",
+                                options=opts,
+                                index=min(default_idx, len(opts) - 1) if opts else 0,
+                                key=f"hist_series_{selected.name}",
+                            )
+                            if choice.endswith("(paired)"):
+                                hid = choice.split(" − ", 1)[0]
+                                deltas = paired_pmd.get(hid) or []
+                                hist_title = f"Paired ({hid} − {baseline}) chip Δ per match"
+                                xlabel = f"{hid} − {baseline} chip delta (paired)"
+                            else:
+                                hid = choice.rsplit(" (absolute)", 1)[0]
+                                deltas = pmd.get(hid) or []
+                                hist_title = f"{hid} chip Δ per match (absolute)"
+                                xlabel = "chip delta per match"
                         else:
+                            # Legacy 2-hero shape.
                             deltas = pmd.get("A_minus_B") or []
                             hist_title = "Paired (A − B) chip Δ per match"
                             xlabel = "A − B chip delta per match (paired)"

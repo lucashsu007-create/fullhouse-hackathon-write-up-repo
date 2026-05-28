@@ -1,3 +1,12 @@
+open venv in ubuntu
+--------------------
+cd /home/lucas/projects/fullhouse-hackathon-write-up-repo
+source .venv/bin/activate
+----------------------------------------------------
+open streamlit app
+---------------
+streamlit run app.py
+----------------------------------------------------
 pull github -> local
 -----------------
 cd ~/projects/fullhouse-hackathon-write-up-repo && \

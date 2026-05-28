@@ -1,31 +1,57 @@
+# ============================================================
+# VARIANT: v7_m2
+# CHANGE:  Marginal cutoff 0.38 -> 0.42 (tighten marginal-call threshold)
+# HYPOTHESIS: v7 calls too many marginal showdowns under deflated equity; tightening folds more. Helps vs tight; risks vs aggressive.
+# DIFF FROM v7: single-line cutoff change in _postflop_by_equity
+#   (if eq >= 0.38:  ->  if eq >= 0.42:)
+#   + BOT_NAME change. Everything else byte-identical to v7.
+# ============================================================
 """
 ================================================================================
-v8.1 — board-conditioned NUTTED, calibration-fixed.
+v7 — range-aware equity on top of v6.
 
-Same architecture as v8 but with one calibration change driven by A/B data:
-the strict board-conditioned filter is applied ONLY on coordinated boards
-(MONOTONE / FOUR_FLUSH / FOUR_STRAIGHT / PAIRED). On DEFAULT (dry / wet
-rainbow) boards, v8.1 falls back to v7's static NUTTED range string
-("JJ+, AKs, AKo") because v7 was an acceptable compromise there.
+WHAT CHANGED vs v6 (postflop equity engine + facing-jam equity filter):
 
-Why: v8 vs v7 on 100-match mixed A/B came back ~flat (−0.2 bb/100, paired
-win rate 11%); on trap-heavy it trended negative (−3.8 bb/100, win rate 4%).
-Equity inspection showed v8's "Two Pair+" filter on DEFAULT boards was too
-tight — it excluded overpairs and AK that real passive players DO raise
-with, causing systematic over-folds. The catastrophic monotone case still
-gets fixed (AA on T98hhh equity 0.03 not 0.61), but K72r rock-raises now
-use v7's static range as before.
+  * equity_vs_random is replaced (where it matters) by equity_vs_range, which
+    samples opponent hands from a RANGE estimate rather than uniformly from
+    all 1326 combos. The action sequence drives the range:
+        - villain limped / loose-passive  -> WIDE  (~55% of combos)
+        - villain opened preflop          -> OPEN  (~22%)
+        - villain 3-bet / 4-bet           -> THREEBET (~7%)
+        - villain checked / no aggression -> UNKNOWN (random, baseline)
+    Postflop continuation actions (call / raise) narrow the preflop range
+    further by intersecting with "hands that connect with this board."
 
-Behaviorally vs v8:
-  * Monotone / 4-flush / 4-straight / paired boards: byte-identical to v8.
-    The catastrophic-equity correction still fires.
-  * Dry / wet-rainbow boards: byte-identical to v7. No more over-folding
-    of AA/AK/KK to a rock's c-bet-raise on K72r-type boards.
+  * "Passive who suddenly raises" override. When PLAYER_STATS shows villain is
+    confirmed-passive (actions >= 20, raise rate < 10%, high call-vs-bet rate)
+    AND villain has raised or jammed this hand, their range is upgraded to
+    NUTTED (~3%: JJ+, AK, plus the made-hands consistent with the board).
+    This is the inverse of v5a's anti-perma logic: v5a says "discount the
+    perma-jammer's aggression"; this says "respect the rock's aggression".
 
-WHAT'S UNCHANGED FROM v7/v8:
-  * Chart preflop (v6), range-aware equity (v7), board classifier (v8)
-  * V3 stats, V4 classifier
-  * Spot RNG, decide() shape, sanitize, emergency
+  * Multiway: hero's equity is now computed by drawing one combo from each
+    live opponent's range per MC iteration, rejecting card conflicts.
+    Heads-up uses eval7's optimized py_hand_vs_range_monte_carlo directly.
+
+WHAT'S UNCHANGED FROM v6:
+  * All chart-preflop logic (per-position opens, defense, 4-bet, jams, HU SB)
+  * Postflop tree shape (_postflop_by_equity thresholds, sizings)
+  * V3 stats collection, V4 classifier, LAST_READ population
+  * sanitize / emergency / warmup hook / spot_rng / spot_seed
+  * The "facing all-in commits stack" equity filter (which now uses range
+    equity, so AKo vs a confirmed-rock's jam is correctly under 50% equity,
+    not the 65% it gets vs random)
+
+Performance note: eval7's py_hand_vs_range_monte_carlo at 2000 iters costs
+about 0.2-0.7ms for HU; we keep total per-decision budget well under 100ms.
+
+WHAT THIS DOES NOT CHANGE:
+  * Strategy thresholds. v6's "bet if eq>=0.72" is unchanged; the equity value
+    fed into it is now more accurate. The thresholds were tuned vs the random-
+    equity estimate, so this is a meaningful behavior change even though no
+    decision constant moved: many spots where v6 thought it had 0.65 equity
+    and called are now correctly read as 0.45 equity and folded (or vice versa
+    on the rock's jam).
 
 stdlib + eval7 only.
 ================================================================================
@@ -43,7 +69,7 @@ except Exception:                              # pragma: no cover
     eval7 = None
     _HAVE_EVAL7 = False
 
-BOT_NAME = "SafeTAG+Range+BoardV2"
+BOT_NAME = "v7-m2"
 BOT_AVATAR = "robot_1"
 
 _RANKS = "23456789TJQKA"
@@ -506,160 +532,6 @@ _HANDRANGES = {k: _build_handrange(v) for k, v in _RANGE_STRINGS.items()} \
     if _HAVE_EVAL7 else {}
 
 
-# ---------------------------------------------------------------------------
-# v8 — board-conditioned NUTTED combo enumeration.
-#
-# The NUTTED range string ("JJ+, AKs, AKo") is correct on dry high-card boards
-# where the nuts is a set and overpairs are realistic raising hands. On
-# coordinated boards (monotone, paired, 4-to-straight), what "the rock has"
-# is completely different — flushes, full houses, made straights. v8 swaps
-# the static NUTTED HandRange for a board-aware combo list whenever the
-# NUTTED bucket is selected.
-# ---------------------------------------------------------------------------
-
-# eval7.handtype() ordering, weakest -> strongest. We threshold by hand-type
-# string rather than the integer value so the code reads cleanly.
-_HANDTYPE_RANK = {
-    "High Card": 0, "Pair": 1, "Two Pair": 2, "Trips": 3, "Straight": 4,
-    "Flush": 5, "Full House": 6, "Quads": 7, "Straight Flush": 8,
-}
-
-
-def _classify_board(board_cards):
-    """Return a label describing the board's coordination structure.
-    board_cards: list of eval7.Card. Length 3, 4, or 5 (flop/turn/river).
-    Labels: MONOTONE / FOUR_FLUSH / PAIRED / FOUR_STRAIGHT / DEFAULT."""
-    if not board_cards:
-        return "DEFAULT"
-    suits = [_CARD_STR.get(c, str(c))[1] for c in board_cards]
-    ranks = [_CARD_STR.get(c, str(c))[0] for c in board_cards]
-    suit_counts = {}
-    for s in suits:
-        suit_counts[s] = suit_counts.get(s, 0) + 1
-    max_suit = max(suit_counts.values())
-    n = len(board_cards)
-
-    # Flush boards. A 4-flush (turn or river) is even more critical than a
-    # flop monotone because the flush is essentially completed by villain
-    # holding ONE card of the suit.
-    if max_suit >= 4:
-        return "FOUR_FLUSH"
-    if max_suit == 3 and n == 3:
-        return "MONOTONE"
-
-    # Paired board: one rank appears twice or more on board.
-    rank_counts = {}
-    for r in ranks:
-        rank_counts[r] = rank_counts.get(r, 0) + 1
-    if max(rank_counts.values()) >= 2:
-        return "PAIRED"
-
-    # 4-to-straight: 4 of the 5 cards we'd need for a straight are present.
-    # Cheap proxy: any 4-in-a-row in the sorted unique board ranks.
-    vals = sorted(set(_RANK_VAL.get(r, 0) for r in ranks))
-    if 14 in vals:
-        vals = sorted(set(vals + [1]))
-    if _has_run(vals, 4):
-        return "FOUR_STRAIGHT"
-
-    return "DEFAULT"
-
-
-# Minimum handtype required for "rock raised here" on each board class.
-_BOARD_NUTTED_THRESHOLD = {
-    "MONOTONE":      "Flush",
-    "FOUR_FLUSH":    "Flush",
-    "FOUR_STRAIGHT": "Straight",
-    "PAIRED":        "Trips",
-    "DEFAULT":       "Two Pair",
-}
-
-
-def _nutted_combos_on_board(board_strs, dead_card_strs):
-    """Enumerate two-card combos that achieve at least the board's nutted-
-    threshold hand type on this board.
-
-    board_strs:     ["Kc", "7d", "2s"] — what's on the board
-    dead_card_strs: ["As", "Ah"]       — hero's hole cards (and any other
-                                          cards we must not deal)
-    Returns: list of (eval7.Card, eval7.Card) tuples.
-
-    If the strict threshold yields <15 combos (e.g. dry K72 with only
-    9 set combos), we widen the filter to include overpairs and top-pair-
-    top-kicker — those are realistic passive-raise hands when the board
-    is dry enough that sets are the de-facto nuts.
-    """
-    if not _HAVE_EVAL7 or not _FULL_DECK:
-        return []
-    try:
-        board_c = [eval7.Card(s) for s in board_strs]
-    except Exception:
-        return []
-    dead = set()
-    try:
-        for s in dead_card_strs:
-            dead.add(eval7.Card(s))
-        for c in board_c:
-            dead.add(c)
-    except Exception:
-        return []
-
-    label = _classify_board(board_c)
-
-    # v8.1 calibration fix: on DEFAULT (dry / wet-rainbow) boards, return
-    # empty pool to signal "use the static NUTTED HandRange instead". v8's
-    # strict Two-Pair+ filter was too tight on these boards — it excluded
-    # overpairs and AK that real passive players raise with, causing
-    # systematic over-folds. The catastrophic monotone/paired/4-flush cases
-    # still get the board-conditioned treatment below.
-    if label == "DEFAULT":
-        return []
-
-    threshold_name = _BOARD_NUTTED_THRESHOLD.get(label, "Two Pair")
-    threshold = _HANDTYPE_RANK[threshold_name]
-
-    # Available cards = deck minus dead.
-    available = [c for c in _FULL_DECK if c not in dead]
-
-    # Top-board-rank cached, for the dry-board fallback check below.
-    top_board_val = max((_RANK_VAL.get(_CARD_STR.get(c, str(c))[0], 0)
-                         for c in board_c), default=0)
-
-    strict, wide = [], []
-    _ev = eval7.evaluate
-    _ht = eval7.handtype
-    _ht_rank = _HANDTYPE_RANK
-
-    # Enumerate combos. With 47 available cards this is C(47,2) = 1081 combos
-    # in the worst case — about 1ms total. Cheap enough to do per-equity-call.
-    for i in range(len(available)):
-        ci = available[i]
-        ci_rank = _RANK_VAL.get(_CARD_STR.get(ci, str(ci))[0], 0)
-        for j in range(i + 1, len(available)):
-            cj = available[j]
-            cj_rank = _RANK_VAL.get(_CARD_STR.get(cj, str(cj))[0], 0)
-            value = _ev([ci, cj] + board_c)
-            rank = _ht_rank.get(_ht(value), 0)
-            if rank >= threshold:
-                strict.append((ci, cj))
-            # Wide fallback: overpair (both hole cards same rank and above
-            # top board) or top-pair-top-kicker (one card matches top board,
-            # other is A or K). Only used if strict pool is too small.
-            elif rank == _ht_rank["Pair"]:
-                if ci_rank == cj_rank and ci_rank > top_board_val:
-                    wide.append((ci, cj))
-                elif (ci_rank == top_board_val and cj_rank >= 13) \
-                        or (cj_rank == top_board_val and ci_rank >= 13):
-                    wide.append((ci, cj))
-
-    # If strict pool is meaty (>=15 combos), use it as-is — that's a true
-    # board-conditioned nut range. Otherwise extend with the wide fallback
-    # so MC has something representative to sample.
-    if len(strict) >= 15:
-        return strict
-    return strict + wide
-
-
 def _villain_is_passive(stats):
     """True if PLAYER_STATS look passive enough that a raise from them is a
     strong signal. Thresholds are conservative — we want few false positives.
@@ -818,37 +690,10 @@ def _equity_vs_multi_range(hole_c, board_c, opp_range_strs, rng,
 
     # Build per-opponent combo lists, filtered against hero+board cards.
     dead_base = set(hole_c) | set(board_c)
-    # Precompute the board-conditioned NUTTED pool once for this call. All
-    # NUTTED opponents in this MC share the same pool (they don't, of course,
-    # all hold the same cards within one MC iter — the sampler picks DIFFERENT
-    # combos from the pool per opponent — but they share the same UNIVERSE of
-    # plausible nutted combos given this exact board, which is the point).
-    nutted_pool_cache = None
     opp_pools = []
     for rs in opp_range_strs:
         if rs == "UNKNOWN":
             opp_pools.append(None)        # signal: any 2 cards
-        elif rs == "NUTTED":
-            # v8: board-conditioned. Build once and reuse for any other
-            # NUTTED opponents in the same call.
-            if nutted_pool_cache is None:
-                board_strs = [_CARD_STR.get(c, str(c)) for c in board_c]
-                dead_strs = [_CARD_STR.get(c, str(c)) for c in hole_c]
-                nutted_pool_cache = _nutted_combos_on_board(
-                    board_strs, dead_strs)
-            if not nutted_pool_cache:
-                # v8.1: this is now the EXPECTED path on DEFAULT boards
-                # (dry / wet-rainbow). _nutted_combos_on_board returns an
-                # empty list for DEFAULT to signal "use the static NUTTED
-                # range instead" — calibration A/B showed v8's strict
-                # filter was too tight on these boards. On coordinated
-                # boards (monotone/paired/4-flush/4-straight) the strict
-                # pool is populated and used as in v8.
-                hr = _HANDRANGES.get("NUTTED")
-                pool = _filter_range_against_deck(hr, dead_base)
-                opp_pools.append(pool if pool else None)
-            else:
-                opp_pools.append(nutted_pool_cache)
         else:
             hr = _HANDRANGES.get(rs)
             pool = _filter_range_against_deck(hr, dead_base)
@@ -2075,7 +1920,7 @@ def _postflop_by_equity(state, eq, pos, can_check, board, rng):
         return {"action": "fold"}
 
     # Marginal showdown / draws: pot-odds call, occasional thin probe.
-    if eq >= 0.38:
+    if eq >= 0.42:
         if can_check:
             return {"action": "check"}
         if eq >= req:

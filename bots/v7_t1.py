@@ -1,44 +1,57 @@
+# ============================================================
+# VARIANT: v7_t1
+# CHANGE:  Strong-value cutoff 0.72 -> 0.68 (loosen value-raising bar)
+# HYPOTHESIS: v7 under-extracts value; lowering the strong-bucket bar lets more hands raise for value/protection. Should help vs callers (squeezer, station); risk vs aggressive opponents.
+# DIFF FROM v7: single-line cutoff change in _postflop_by_equity
+#   (if eq >= 0.72:  ->  if eq >= 0.68:)
+#   + BOT_NAME change. Everything else byte-identical to v7.
+# ============================================================
 """
 ================================================================================
-v9 — opponent-conditional exploits on top of v8.
+v7 — range-aware equity on top of v6.
 
-Three independently-flagged modules; each reads LAST_READ / PLAYER_STATS and
-nudges a specific decision when a matching opponent is detected. Disable any
-module with its top-level flag without affecting the others.
+WHAT CHANGED vs v6 (postflop equity engine + facing-jam equity filter):
 
-  * ANTI-PERMA (range correction):
-      When villain is detected as a perma-jammer, override their range to
-      UNKNOWN (random) instead of OPEN/THREEBET. v7/v8 currently misclassify
-      a perma-jammer's raise as an opener range, under-estimating hero's
-      equity. The fix lets hero call wider vs perma-jams (the opposite of
-      v5a, which tightened — v5a accepted v4.1's correct-vs-random equity
-      and added a variance margin; v9a fixes the range itself).
-      Trigger: top_impl==perma_all_in with conf>=0.70, OR observed
-      allins>=4 and allins/actions > 0.25 (15+ action sample).
+  * equity_vs_random is replaced (where it matters) by equity_vs_range, which
+    samples opponent hands from a RANGE estimate rather than uniformly from
+    all 1326 combos. The action sequence drives the range:
+        - villain limped / loose-passive  -> WIDE  (~55% of combos)
+        - villain opened preflop          -> OPEN  (~22%)
+        - villain 3-bet / 4-bet           -> THREEBET (~7%)
+        - villain checked / no aggression -> UNKNOWN (random, baseline)
+    Postflop continuation actions (call / raise) narrow the preflop range
+    further by intersecting with "hands that connect with this board."
 
-  * ANTI-STATION (postflop sizing + bluff suppression):
-      When villain is detected as a station, postflop overrides apply:
-      thinner value (extends to ~0.46 equity), bigger sizing (0.55-0.95 pot
-      for value), and weak/air hands NEVER bluff. The "tighter call vs
-      station raise" piece from v5b is NOT ported because v8's passive-
-      raises-NUTTED override already handles it.
-      Trigger: top_impl==calling_bot with conf>=0.70, OR top_behav==station
-      with conf>=0.65, OR observed call_vs_bet/faced_bet >= 0.65 over 20+
-      bets faced.
+  * "Passive who suddenly raises" override. When PLAYER_STATS shows villain is
+    confirmed-passive (actions >= 20, raise rate < 10%, high call-vs-bet rate)
+    AND villain has raised or jammed this hand, their range is upgraded to
+    NUTTED (~3%: JJ+, AK, plus the made-hands consistent with the board).
+    This is the inverse of v5a's anti-perma logic: v5a says "discount the
+    perma-jammer's aggression"; this says "respect the rock's aggression".
 
-  * ANTI-FOLDER (capped overfolder bluff):
-      When villain is detected as an overfolder AND all gates pass (heads-up,
-      dry board, checked pot, not a sticky type, break-even with safety
-      margin, frequency cap), fire a small c-bet/steal with weak/air hands
-      that would otherwise check. v5c verbatim. The only +aggression module.
-      Trigger: top_impl==folding_bot with conf>=0.70 and lambda>0.30, OR
-      observed fold_vs_bet/faced_bet>=0.70 over 25+ bets faced. Hard exclude
-      anyone tagged station/calling_bot/perma_all_in regardless of fold rate.
+  * Multiway: hero's equity is now computed by drawing one combo from each
+    live opponent's range per MC iteration, rejecting card conflicts.
+    Heads-up uses eval7's optimized py_hand_vs_range_monte_carlo directly.
 
-WHAT'S UNCHANGED FROM v8:
-  * Chart preflop (v6), range-aware equity (v7), board-conditioned NUTTED (v8)
-  * V3 stats, V4 classifier (still collection-only outside the v9 gates)
-  * Spot RNG, decide() shape, sanitize, emergency
+WHAT'S UNCHANGED FROM v6:
+  * All chart-preflop logic (per-position opens, defense, 4-bet, jams, HU SB)
+  * Postflop tree shape (_postflop_by_equity thresholds, sizings)
+  * V3 stats collection, V4 classifier, LAST_READ population
+  * sanitize / emergency / warmup hook / spot_rng / spot_seed
+  * The "facing all-in commits stack" equity filter (which now uses range
+    equity, so AKo vs a confirmed-rock's jam is correctly under 50% equity,
+    not the 65% it gets vs random)
+
+Performance note: eval7's py_hand_vs_range_monte_carlo at 2000 iters costs
+about 0.2-0.7ms for HU; we keep total per-decision budget well under 100ms.
+
+WHAT THIS DOES NOT CHANGE:
+  * Strategy thresholds. v6's "bet if eq>=0.72" is unchanged; the equity value
+    fed into it is now more accurate. The thresholds were tuned vs the random-
+    equity estimate, so this is a meaningful behavior change even though no
+    decision constant moved: many spots where v6 thought it had 0.65 equity
+    and called are now correctly read as 0.45 equity and folded (or vice versa
+    on the rock's jam).
 
 stdlib + eval7 only.
 ================================================================================
@@ -56,7 +69,7 @@ except Exception:                              # pragma: no cover
     eval7 = None
     _HAVE_EVAL7 = False
 
-BOT_NAME = "SafeTAG+Station2"
+BOT_NAME = "v7-t1"
 BOT_AVATAR = "robot_1"
 
 _RANKS = "23456789TJQKA"
@@ -519,159 +532,6 @@ _HANDRANGES = {k: _build_handrange(v) for k, v in _RANGE_STRINGS.items()} \
     if _HAVE_EVAL7 else {}
 
 
-# ---------------------------------------------------------------------------
-# v8 — board-conditioned NUTTED combo enumeration.
-#
-# The NUTTED range string ("JJ+, AKs, AKo") is correct on dry high-card boards
-# where the nuts is a set and overpairs are realistic raising hands. On
-# coordinated boards (monotone, paired, 4-to-straight), what "the rock has"
-# is completely different — flushes, full houses, made straights. v8 swaps
-# the static NUTTED HandRange for a board-aware combo list whenever the
-# NUTTED bucket is selected.
-# ---------------------------------------------------------------------------
-
-# eval7.handtype() ordering, weakest -> strongest. We threshold by hand-type
-# string rather than the integer value so the code reads cleanly.
-_HANDTYPE_RANK = {
-    "High Card": 0, "Pair": 1, "Two Pair": 2, "Trips": 3, "Straight": 4,
-    "Flush": 5, "Full House": 6, "Quads": 7, "Straight Flush": 8,
-}
-
-
-def _classify_board(board_cards):
-    """Return a label describing the board's coordination structure.
-    board_cards: list of eval7.Card. Length 3, 4, or 5 (flop/turn/river).
-    Labels: MONOTONE / FOUR_FLUSH / PAIRED / FOUR_STRAIGHT / DEFAULT."""
-    if not board_cards:
-        return "DEFAULT"
-    suits = [_CARD_STR.get(c, str(c))[1] for c in board_cards]
-    ranks = [_CARD_STR.get(c, str(c))[0] for c in board_cards]
-    suit_counts = {}
-    for s in suits:
-        suit_counts[s] = suit_counts.get(s, 0) + 1
-    max_suit = max(suit_counts.values())
-    n = len(board_cards)
-
-    # Flush boards. A 4-flush (turn or river) is even more critical than a
-    # flop monotone because the flush is essentially completed by villain
-    # holding ONE card of the suit.
-    if max_suit >= 4:
-        return "FOUR_FLUSH"
-    if max_suit == 3 and n == 3:
-        return "MONOTONE"
-
-    # Paired board: one rank appears twice or more on board.
-    rank_counts = {}
-    for r in ranks:
-        rank_counts[r] = rank_counts.get(r, 0) + 1
-    if max(rank_counts.values()) >= 2:
-        return "PAIRED"
-
-    # 4-to-straight: 4 of the 5 cards we'd need for a straight are present.
-    # Cheap proxy: any 4-in-a-row in the sorted unique board ranks.
-    vals = sorted(set(_RANK_VAL.get(r, 0) for r in ranks))
-    if 14 in vals:
-        vals = sorted(set(vals + [1]))
-    if _has_run(vals, 4):
-        return "FOUR_STRAIGHT"
-
-    return "DEFAULT"
-
-
-# Minimum handtype required for "rock raised here" on each board class.
-_BOARD_NUTTED_THRESHOLD = {
-    "MONOTONE":      "Flush",
-    "FOUR_FLUSH":    "Flush",
-    "FOUR_STRAIGHT": "Straight",
-    "PAIRED":        "Trips",
-    "DEFAULT":       "Two Pair",
-}
-
-
-def _nutted_combos_on_board(board_strs, dead_card_strs):
-    """Enumerate two-card combos that achieve at least the board's nutted-
-    threshold hand type on this board.
-
-    board_strs:     ["Kc", "7d", "2s"] — what's on the board
-    dead_card_strs: ["As", "Ah"]       — hero's hole cards (and any other
-                                          cards we must not deal)
-    Returns: list of (eval7.Card, eval7.Card) tuples.
-
-    If the strict threshold yields <15 combos (e.g. dry K72 with only
-    9 set combos), we widen the filter to include overpairs and top-pair-
-    top-kicker — those are realistic passive-raise hands when the board
-    is dry enough that sets are the de-facto nuts.
-    """
-    if not _HAVE_EVAL7 or not _FULL_DECK:
-        return []
-    try:
-        board_c = [eval7.Card(s) for s in board_strs]
-    except Exception:
-        return []
-    dead = set()
-    try:
-        for s in dead_card_strs:
-            dead.add(eval7.Card(s))
-        for c in board_c:
-            dead.add(c)
-    except Exception:
-        return []
-
-    label = _classify_board(board_c)
-
-    # v8.1 calibration fix: on DEFAULT (dry / wet-rainbow) boards, return
-    # empty pool to signal "use the static NUTTED HandRange instead". v8's
-    # strict Two-Pair+ filter was too tight on these boards (A/B vs v7
-    # showed systematic over-folds). Catastrophic monotone / paired /
-    # 4-flush / 4-straight cases still get the board-conditioned treatment.
-    if label == "DEFAULT":
-        return []
-
-    threshold_name = _BOARD_NUTTED_THRESHOLD.get(label, "Two Pair")
-    threshold = _HANDTYPE_RANK[threshold_name]
-
-    # Available cards = deck minus dead.
-    available = [c for c in _FULL_DECK if c not in dead]
-
-    # Top-board-rank cached, for the dry-board fallback check below.
-    top_board_val = max((_RANK_VAL.get(_CARD_STR.get(c, str(c))[0], 0)
-                         for c in board_c), default=0)
-
-    strict, wide = [], []
-    _ev = eval7.evaluate
-    _ht = eval7.handtype
-    _ht_rank = _HANDTYPE_RANK
-
-    # Enumerate combos. With 47 available cards this is C(47,2) = 1081 combos
-    # in the worst case — about 1ms total. Cheap enough to do per-equity-call.
-    for i in range(len(available)):
-        ci = available[i]
-        ci_rank = _RANK_VAL.get(_CARD_STR.get(ci, str(ci))[0], 0)
-        for j in range(i + 1, len(available)):
-            cj = available[j]
-            cj_rank = _RANK_VAL.get(_CARD_STR.get(cj, str(cj))[0], 0)
-            value = _ev([ci, cj] + board_c)
-            rank = _ht_rank.get(_ht(value), 0)
-            if rank >= threshold:
-                strict.append((ci, cj))
-            # Wide fallback: overpair (both hole cards same rank and above
-            # top board) or top-pair-top-kicker (one card matches top board,
-            # other is A or K). Only used if strict pool is too small.
-            elif rank == _ht_rank["Pair"]:
-                if ci_rank == cj_rank and ci_rank > top_board_val:
-                    wide.append((ci, cj))
-                elif (ci_rank == top_board_val and cj_rank >= 13) \
-                        or (cj_rank == top_board_val and ci_rank >= 13):
-                    wide.append((ci, cj))
-
-    # If strict pool is meaty (>=15 combos), use it as-is — that's a true
-    # board-conditioned nut range. Otherwise extend with the wide fallback
-    # so MC has something representative to sample.
-    if len(strict) >= 15:
-        return strict
-    return strict + wide
-
-
 def _villain_is_passive(stats):
     """True if PLAYER_STATS look passive enough that a raise from them is a
     strong signal. Thresholds are conservative — we want few false positives.
@@ -732,8 +592,6 @@ def _range_for_villain(state, villain_seat, villain_bot_id):
     Returns one of WIDE / OPEN / THREEBET / NUTTED / UNKNOWN.
 
     Priority order:
-      0. v9 anti-perma override: if villain is a detected perma-jammer, their
-         range is essentially any-two-cards regardless of action -> UNKNOWN.
       1. Passive-rocket override: confirmed passive villain who has raised
          or jammed this hand -> NUTTED.
       2. 4-bet or higher          -> NUTTED.
@@ -742,11 +600,6 @@ def _range_for_villain(state, villain_seat, villain_bot_id):
       5. Called preflop / limped  -> WIDE.
       6. Hasn't voluntarily acted -> UNKNOWN (random fallback).
     """
-    # (0) v9 anti-perma: bypass the action-based bucketing. A perma-jammer's
-    # "raise" is meaningless — they jam ATC. Treat range as random.
-    if _ANTIPERMA_ENABLED and _opp_is_perma(villain_bot_id):
-        return "UNKNOWN"
-
     info = _villain_action_summary(state, villain_seat)
     stats = PLAYER_STATS.get(villain_bot_id)
 
@@ -837,35 +690,10 @@ def _equity_vs_multi_range(hole_c, board_c, opp_range_strs, rng,
 
     # Build per-opponent combo lists, filtered against hero+board cards.
     dead_base = set(hole_c) | set(board_c)
-    # Precompute the board-conditioned NUTTED pool once for this call. All
-    # NUTTED opponents in this MC share the same pool (they don't, of course,
-    # all hold the same cards within one MC iter — the sampler picks DIFFERENT
-    # combos from the pool per opponent — but they share the same UNIVERSE of
-    # plausible nutted combos given this exact board, which is the point).
-    nutted_pool_cache = None
     opp_pools = []
     for rs in opp_range_strs:
         if rs == "UNKNOWN":
             opp_pools.append(None)        # signal: any 2 cards
-        elif rs == "NUTTED":
-            # v8: board-conditioned. Build once and reuse for any other
-            # NUTTED opponents in the same call.
-            if nutted_pool_cache is None:
-                board_strs = [_CARD_STR.get(c, str(c)) for c in board_c]
-                dead_strs = [_CARD_STR.get(c, str(c)) for c in hole_c]
-                nutted_pool_cache = _nutted_combos_on_board(
-                    board_strs, dead_strs)
-            if not nutted_pool_cache:
-                # v8.1: this is the EXPECTED path on DEFAULT boards
-                # (dry / wet-rainbow). _nutted_combos_on_board returns an
-                # empty list for DEFAULT to signal "use the static NUTTED
-                # range instead" — calibration A/B showed v8's strict
-                # filter was too tight on these boards.
-                hr = _HANDRANGES.get("NUTTED")
-                pool = _filter_range_against_deck(hr, dead_base)
-                opp_pools.append(pool if pool else None)
-            else:
-                opp_pools.append(nutted_pool_cache)
         else:
             hr = _HANDRANGES.get(rs)
             pool = _filter_range_against_deck(hr, dead_base)
@@ -1997,260 +1825,6 @@ def _required_equity(state):
 
 
 # ===========================================================================
-# V9 — opponent-conditional exploit modules (three independent flags)
-# ===========================================================================
-# Each module:
-#   1) reads PLAYER_STATS / LAST_READ
-#   2) detects a specific opponent archetype with conservative gates
-#   3) nudges ONE decision when detected
-# Modules don't interact with each other directly. Disable any module with its
-# top-level flag — useful for ablation A/B (v9a, v9b, v9c isolate each effect).
-
-# Top-level enable flags. v9b isolate: only anti-station.
-_ANTIPERMA_ENABLED  = False
-_ANTISTATION_ENABLED = True
-_ANTIFOLDER_ENABLED  = False
-
-# Tuning knobs — copied from v5b/v5c calibration. Treat as fixed for now.
-_AS_THIN_VALUE_FLOOR = 0.46
-_AS_VALUE_BET_PROB   = 0.92
-_AS_STRONG_SIZE      = 0.95
-_AS_THIN_SIZE        = 0.55
-_AS_RAISE_CALL_MARGIN = 0.10
-_AF_BLUFF_SIZE       = 0.50
-_AF_FREQ_CAP         = 0.65
-_AF_SAFETY_MARGIN    = 0.12
-_AF_MIN_FACED        = 25
-_AF_FOLD_TRIGGER     = 0.70
-_AF_CONF             = 0.70
-_AF_LAMBDA           = 0.30
-_AF_NEVER_BLUFF      = ("station", "calling_bot", "perma_all_in")
-
-
-# ---- shared helpers (used by multiple modules) ----------------------------
-
-def _current_opponent_id(state):
-    """Best-effort relevant-opponent id: aggressor we're facing, else main
-    villain from LAST_READ, else the lone live opponent. Read-only."""
-    me = state.get("seat_to_act")
-    seat_to_id = {}
-    live = []
-    for p in state.get("players") or []:
-        try:
-            seat_to_id[p["seat"]] = p["bot_id"]
-            if p["seat"] != me and not p.get("is_folded") and p.get("state") != "busted":
-                live.append(p["bot_id"])
-        except (KeyError, TypeError):
-            continue
-    last = None
-    try:
-        for a in state.get("action_log", []):
-            if a.get("action") in ("raise", "all_in") and a.get("seat") != me:
-                last = a.get("seat")
-    except Exception:
-        last = None
-    if last is not None and last in seat_to_id:
-        return seat_to_id[last]
-    try:
-        v = LAST_READ.get("villain")
-        if v in live:
-            return v
-    except Exception:
-        pass
-    return live[0] if len(live) == 1 else None
-
-
-def _facing_opp_raise_this_street(state):
-    """True if the bet we're facing came from an opponent's raise/all_in."""
-    if state.get("amount_owed", 0) <= 0:
-        return False
-    me = state.get("seat_to_act")
-    try:
-        for a in state.get("action_log", []):
-            if a.get("action") in ("raise", "all_in") and a.get("seat") != me:
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def _n_live_opponents_safe(state):
-    me = state.get("seat_to_act")
-    n = 0
-    for p in state.get("players") or []:
-        try:
-            if p["seat"] != me and not p.get("is_folded") and p.get("state") != "busted":
-                n += 1
-        except (KeyError, TypeError):
-            continue
-    return n
-
-
-# ---- ANTI-PERMA: range correction -----------------------------------------
-
-def _opp_is_perma(bot_id):
-    """True if this opponent qualifies as a perma-jammer.
-    Trigger (either): high-confidence implementation read perma_all_in for
-    THIS villain, OR extreme observed jam rate (15+ actions, 4+ allins,
-    >25% all-in rate)."""
-    if not bot_id:
-        return False
-    st = PLAYER_STATS.get(bot_id)
-    if st:
-        actions = st.get("actions", 0)
-        allins = st.get("allins", 0)
-        if actions >= 15 and allins >= 4 and (allins / actions) > 0.25:
-            return True
-    try:
-        if LAST_READ.get("villain") == bot_id:
-            if (LAST_READ.get("top_impl") == "perma_all_in"
-                    and LAST_READ.get("confidence", 0.0) >= 0.70):
-                return True
-    except Exception:
-        pass
-    return False
-
-
-# ---- ANTI-STATION: postflop sizing + bluff suppression --------------------
-
-def _opp_is_station(bot_id):
-    """True if this opponent qualifies as a station."""
-    if not bot_id:
-        return False
-    st = PLAYER_STATS.get(bot_id)
-    if st:
-        fb = st.get("faced_bet", 0)
-        if fb >= 20 and (st.get("call_vs_bet", 0) / fb) >= 0.65:
-            return True
-    try:
-        if LAST_READ.get("villain") == bot_id:
-            if (LAST_READ.get("top_impl") == "calling_bot"
-                    and LAST_READ.get("confidence", 0.0) >= 0.70):
-                return True
-            if (LAST_READ.get("top_behav") == "station"
-                    and LAST_READ.get("confidence", 0.0) >= 0.65):
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def _antistation_active(state):
-    if not _ANTISTATION_ENABLED:
-        return False
-    try:
-        return _opp_is_station(_current_opponent_id(state))
-    except Exception:
-        return False
-
-
-def _postflop_vs_station(state, eq, can_check, rng):
-    """v5b-style overrides: thin & big value vs stations, no bluffs.
-    The "tighter call vs station raise" branch is omitted — v8's NUTTED
-    handles it via the passive-rocket override for the rare case."""
-    req = _required_equity(state)
-    if can_check:
-        if eq >= 0.72:
-            return {"action": "raise", "amount": _raise_to(state, _AS_STRONG_SIZE)}
-        if eq >= 0.55:
-            if rng.random() < _AS_VALUE_BET_PROB:
-                return {"action": "raise", "amount": _raise_to(state, _AS_THIN_SIZE)}
-            return {"action": "check"}
-        if eq >= _AS_THIN_VALUE_FLOOR:
-            if rng.random() < 0.5:
-                return {"action": "raise", "amount": _raise_to(state, 0.5)}
-            return {"action": "check"}
-        # weak/air vs station: NEVER bluff
-        return {"action": "check"}
-    # facing a bet from a station
-    tighten = _AS_RAISE_CALL_MARGIN if _facing_opp_raise_this_street(state) else 0.0
-    if eq >= 0.72:
-        if eq >= 0.85 and rng.random() < 0.6:
-            return {"action": "raise", "amount": _raise_to(state, _AS_STRONG_SIZE)}
-        return {"action": "call"}
-    if eq >= 0.55:
-        if eq >= req + 0.05 + tighten:
-            return {"action": "call"}
-        return {"action": "fold"}
-    if eq >= 0.38:
-        if eq >= req + tighten:
-            return {"action": "call"}
-        return {"action": "fold"}
-    return {"action": "fold"}
-
-
-# ---- ANTI-FOLDER: capped overfolder bluff ---------------------------------
-
-def _opp_is_overfolder(bot_id):
-    """True if villain qualifies as an overfolder AND is not a sticky type."""
-    if not bot_id:
-        return False
-    # Hard exclude sticky / jam types via LAST_READ for THIS villain.
-    try:
-        if LAST_READ.get("villain") == bot_id:
-            if LAST_READ.get("top_impl") in _AF_NEVER_BLUFF:
-                return False
-            if LAST_READ.get("top_behav") in _AF_NEVER_BLUFF:
-                return False
-    except Exception:
-        pass
-    st = PLAYER_STATS.get(bot_id)
-    # Also exclude by raw observed call rate.
-    if st:
-        fb = st.get("faced_bet", 0)
-        if fb >= 20 and (st.get("call_vs_bet", 0) / fb) >= 0.5:
-            return False
-        if fb >= _AF_MIN_FACED and (st.get("fold_vs_bet", 0) / fb) >= _AF_FOLD_TRIGGER:
-            return True
-    try:
-        if LAST_READ.get("villain") == bot_id:
-            if (LAST_READ.get("top_impl") == "folding_bot"
-                    and LAST_READ.get("confidence", 0.0) >= _AF_CONF
-                    and LAST_READ.get("lambda", 0.0) > _AF_LAMBDA):
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def _observed_fold_rate(bot_id):
-    st = PLAYER_STATS.get(bot_id)
-    if not st:
-        return 0.0
-    fb = st.get("faced_bet", 0)
-    return (st.get("fold_vs_bet", 0) / fb) if fb else 0.0
-
-
-def _antifolder_should_bluff(state, board):
-    """All v5c gates. Returns True only when all conditions hold."""
-    if not _ANTIFOLDER_ENABLED:
-        return False
-    try:
-        # Only bluff into a checked pot — also satisfies "stop if villain raises"
-        if not state.get("can_check", False) or state.get("amount_owed", 0) > 0:
-            return False
-        if _n_live_opponents_safe(state) != 1:
-            return False
-        if not _board_is_dry(board):
-            return False
-        opp = _current_opponent_id(state)
-        if not _opp_is_overfolder(opp):
-            return False
-        pot = state.get("pot", 0)
-        bet = int(pot * _AF_BLUFF_SIZE)
-        if pot <= 0 or bet <= 0:
-            return False
-        fold_needed = bet / (pot + bet)
-        if _observed_fold_rate(opp) <= fold_needed + _AF_SAFETY_MARGIN:
-            return False
-        if _spot_rng(state).random() >= _AF_FREQ_CAP:
-            return False
-        return True
-    except Exception:
-        return False
-
-
-# ===========================================================================
 # Strategy (SafeTAG, now equity-driven postflop) — V2 behaviour
 # ===========================================================================
 
@@ -2327,13 +1901,8 @@ def _safetag(state):
 def _postflop_by_equity(state, eq, pos, can_check, board, rng):
     req = _required_equity(state)
 
-    # v9 anti-station: full postflop override when station detected.
-    # Replaces the entire decision flow with v5b-style thin-value / no-bluff.
-    if _antistation_active(state):
-        return _postflop_vs_station(state, eq, can_check, rng)
-
     # Strong value: bet/raise.
-    if eq >= 0.72:
+    if eq >= 0.68:
         if can_check:
             return {"action": "raise", "amount": _raise_to(state, 0.7)}
         if eq >= 0.85 and rng.random() < 0.6:
@@ -2360,11 +1929,6 @@ def _postflop_by_equity(state, eq, pos, can_check, board, rng):
 
     # Weak: mostly give up; rare dry-board steal in position.
     if can_check:
-        # v9 anti-folder: capped c-bet vs detected overfolder. All gates
-        # checked inside _antifolder_should_bluff. Replaces the rare
-        # baseline dry-board steal in this spot when active.
-        if _antifolder_should_bluff(state, board):
-            return {"action": "raise", "amount": _raise_to(state, _AF_BLUFF_SIZE)}
         if pos > 0.6 and _board_is_dry(board) and rng.random() < 0.18:
             return {"action": "raise", "amount": _raise_to(state, 0.5)}
         return {"action": "check"}

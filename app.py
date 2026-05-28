@@ -504,6 +504,13 @@ def run_job(job, results_dir, progress_callback=None) -> None:
     job["started_at"] = _now_iso()
     try:
         params = job["params"]
+        # Workers + the parent's engine-repo path get forwarded so the pool's
+        # initializer in analysis.py can recreate the parent's import surface
+        # in each worker process. Both default cleanly: workers=1 keeps the
+        # original serial behavior; an empty repo_path means "let backtest's
+        # auto-discovery find the engine" (same as the parent).
+        n_workers = int(params.get("workers", 1) or 1)
+        worker_repo_path = (st.session_state.get("repo_path") or "").strip() or None
         if job["mode"] == "eval":
             result = analysis._run_eval(
                 hero_path=job["hero"]["path"],
@@ -516,6 +523,8 @@ def run_job(job, results_dir, progress_callback=None) -> None:
                 reload=params["reload"],
                 rotate_seats=params["rotate_seats"],
                 progress_callback=progress_callback,
+                workers=n_workers,
+                worker_repo_path=worker_repo_path,
             )
         elif job["mode"] == "ab":
             result = analysis._run_multi(
@@ -528,6 +537,8 @@ def run_job(job, results_dir, progress_callback=None) -> None:
                 budget=params["budget"],
                 fold_on_timeout=params["fold_on_timeout"],
                 progress_callback=progress_callback,
+                workers=n_workers,
+                worker_repo_path=worker_repo_path,
             )
         else:
             raise ValueError(f"Unknown job mode: {job['mode']!r}")
@@ -818,6 +829,38 @@ with tab_run:
             reload_each = True
             rotate = False
 
+        # ----- Parallelism -----
+        # One worker = serial (original behavior). >1 dispatches matches across
+        # a process pool inside analysis._run_eval / _run_multi. Memory grows
+        # roughly linearly: ~200 MB × workers, since each worker loads its own
+        # copy of the engine + bot modules. Default = cpu_count - 1 so the OS
+        # and Streamlit stay responsive while everything else goes to backtests.
+        _cpu = os.cpu_count() or 2
+        _default_workers = max(1, _cpu - 1)
+        pw1, pw2, _ = st.columns(3)
+        workers = pw1.number_input(
+            "Workers (parallel matches)",
+            min_value=1, max_value=max(_cpu, 32),
+            value=_default_workers, step=1, key="cfg_workers",
+            help=("Each worker is a separate Python process running matches "
+                  "in parallel. 1 = original sequential behavior. Memory: "
+                  "~200 MB × workers. eval-mode parallelism requires "
+                  "'Reload bots per match' = on; otherwise it falls back to "
+                  "serial. ab mode always reloads, so workers always apply."),
+        )
+        # Surface the auto-fallback so it doesn't look like the worker count
+        # is being ignored.
+        if mode == "eval" and int(workers) > 1 and not reload_each:
+            pw2.warning(
+                "Parallel mode needs 'Reload bots per match' on — will run "
+                "serially (1 worker) until you tick it."
+            )
+        elif int(workers) > 1:
+            pw2.caption(
+                f"≈ {int(workers)}× wall-clock speedup target on this job "
+                f"(machine reports {_cpu} CPUs)."
+            )
+
         label = st.text_input(
             "Run label (optional)",
             key="cfg_label",
@@ -833,6 +876,7 @@ with tab_run:
             "seed_base": int(seed_base),
             "budget": float(budget),
             "fold_on_timeout": bool(fold_on_timeout),
+            "workers": int(workers),
         }
         if mode == "eval":
             params["reload"] = bool(reload_each)
@@ -870,12 +914,17 @@ with tab_run:
                 st.success(f"Queued: {job['label']}  (id `{job['job_id']}`).")
 
         # ----- Batch sweep -----
-        with st.expander("Batch sweep across presets"):
+        with st.expander("Batch sweep across presets × seeds"):
             st.caption(
-                "Queue one job per selected preset (duplicates preserved). Uses "
-                "the current mode, hero(es), and parameters above. Each preset's "
-                "bots become that job's "
+                "Queue one job per (preset × seed) combination — duplicates "
+                "preserved inside each preset. Uses the current mode, hero(es), "
+                "and parameters above; the **Seed base** field is ignored when "
+                "the Seeds list below is non-empty. Each preset's bots become "
+                "that job's "
                 + ("opponents." if mode == "eval" else "field.")
+                + (" In ab mode all currently selected heroes go into every "
+                   "queued job as paired arms — don't split them into separate "
+                   "2-way jobs." if mode == "ab" else "")
             )
             if not presets:
                 st.info("No presets saved yet. Create some in Tab 1 first.")
@@ -885,18 +934,65 @@ with tab_run:
                     options=[p["name"] for p in presets],
                     key="sweep_presets",
                 )
+                seeds_text = st.text_input(
+                    "Seeds (comma- or space-separated; blank = single seed "
+                    "from Seed base above)",
+                    key="sweep_seeds",
+                    placeholder="e.g. 0, 1, 2, 3, 4",
+                    help="One job per (preset × seed) combination. With 3 "
+                         "presets × 5 seeds that's 15 jobs queued in one click "
+                         "— then 'Run all pending' below and walk away.",
+                )
+
+                # Parse seeds into a deduped, order-preserving int list. Blank
+                # → fall back to the single Seed base from the params panel
+                # (preserves the old single-seed sweep behavior).
+                seed_list: list[int] = []
+                seeds_err: str | None = None
+                if seeds_text.strip():
+                    seen: set[int] = set()
+                    for tok in seeds_text.replace(",", " ").split():
+                        try:
+                            v = int(tok)
+                        except ValueError:
+                            seeds_err = (
+                                f"can't parse {tok!r} as an integer — use "
+                                "e.g. `0, 1, 2, 3, 4`"
+                            )
+                            seed_list = []
+                            break
+                        if v not in seen:
+                            seen.add(v)
+                            seed_list.append(v)
+                else:
+                    seed_list = [int(params["seed_base"])]
+                if seeds_err:
+                    st.error(seeds_err)
+
                 sweep_label_prefix = st.text_input(
                     "Label prefix (optional)",
                     key="sweep_label_prefix",
                     placeholder="e.g. v9_vs_v8.1",
-                    help="Appended with ' · <preset>' for each queued job.",
+                    help="Appended with ' · <preset> · s<seed>' for each "
+                         "queued job so per-match comparison stays unambiguous.",
                 )
+
+                n_jobs_preview = len(sweep_choices) * len(seed_list)
+                st.caption(
+                    f"Will queue **{n_jobs_preview}** job(s) "
+                    f"({len(sweep_choices)} preset(s) × {len(seed_list)} "
+                    f"seed(s))."
+                )
+
                 disabled = (
                     not sweep_choices
+                    or not seed_list
+                    or seeds_err is not None
                     or (mode == "ab" and len(hero_choices) < 2)
                 )
                 if st.button(
-                    f"Queue sweep across {len(sweep_choices)} preset(s)",
+                    f"Queue sweep ({n_jobs_preview} job(s): "
+                    f"{len(sweep_choices)} preset × {len(seed_list)} seed)",
                     disabled=disabled,
                     key="queue_sweep",
                 ):
@@ -915,23 +1011,37 @@ with tab_run:
                             skipped_big.append(pname)
                             continue
                         opps = [opp_by_id[b] for b in field_ids]  # dups kept
-                        sweep_label = (f"{sweep_label_prefix} · {pname}"
-                                       if sweep_label_prefix else f"sweep:{pname}")
-                        if mode == "eval":
-                            j = make_eval_job(
-                                label=sweep_label, hero=hero_by_id[hero_id],
-                                opponents=opps, preset_name=pname, params=params,
+                        # Inner loop over seeds: each (preset, seed) gets its
+                        # own job with params.seed_base overridden. Copy params
+                        # per-iteration so jobs don't share a mutable dict.
+                        for seed in seed_list:
+                            job_params = dict(params)
+                            job_params["seed_base"] = seed
+                            sweep_label = (
+                                f"{sweep_label_prefix} · {pname} · s{seed}"
+                                if sweep_label_prefix
+                                else f"sweep:{pname}:s{seed}"
                             )
-                        else:
-                            j = make_ab_job(
-                                label=sweep_label,
-                                heroes=[hero_by_id[h] for h in hero_choices],
-                                baseline=baseline_id,
-                                opponents=opps, preset_name=pname, params=params,
-                            )
-                        st.session_state.queue.append(j)
-                        added += 1
-                    msg = f"Queued {added} job(s) from sweep."
+                            if mode == "eval":
+                                j = make_eval_job(
+                                    label=sweep_label,
+                                    hero=hero_by_id[hero_id],
+                                    opponents=opps, preset_name=pname,
+                                    params=job_params,
+                                )
+                            else:
+                                j = make_ab_job(
+                                    label=sweep_label,
+                                    heroes=[hero_by_id[h] for h in hero_choices],
+                                    baseline=baseline_id,
+                                    opponents=opps, preset_name=pname,
+                                    params=job_params,
+                                )
+                            st.session_state.queue.append(j)
+                            added += 1
+                    msg = (f"Queued {added} job(s) from sweep "
+                           f"({len(sweep_choices)} preset × "
+                           f"{len(seed_list)} seed).")
                     if skipped_empty:
                         msg += (" Skipped (no opponents found in pool): "
                                 + ", ".join(skipped_empty) + ".")

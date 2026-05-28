@@ -27,9 +27,12 @@ import datetime as dt
 import io
 import json
 import math
+import os
 import random
 import statistics
+import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 # --- Harness primitives, injected via bind_harness() -----------------------
@@ -111,9 +114,109 @@ def _ev_of(res) -> dict:
     return res.get("ev_chip_delta") or res.get("chip_delta") or {}
 
 
+# ---------------------------------------------------------------------------
+# Parallel match dispatch (process pool)
+# ---------------------------------------------------------------------------
+# Each match is independent (its own seed_base+i and its own freshly built
+# decide_map), so the per-match for-loops in _run_eval / _run_multi are
+# embarrassingly parallel. We dispatch via ProcessPoolExecutor with one task
+# per match index. For _run_multi each task does the whole match-index ROUND
+# (all heroes against the same field at the same seat/seed) so the paired
+# (hero − baseline) per-match alignment that the rest of analysis.py relies
+# on stays exact: per-hero arrays are filled by index `i`, not arrival order.
+#
+# Why processes, not threads:
+#   * Each worker has its own sys.modules → load_decide's _bt_bot_N uniqueness
+#     and the bot-state-reset-per-match guarantee survive across workers.
+#   * The per-action budget is wall-clock inside run_match_inproc; if any
+#     signal.alarm path is used it only works from a process's main thread,
+#     which threads would violate.
+#   * eval7 / engine code is CPU-bound; processes sidestep the GIL.
+#
+# Why one task per match (not per-hero sub-match in _run_multi): keeps the
+# paired-round structure visible as the unit of progress, and at 5 heroes per
+# round × ~5s each, round granularity is already small relative to total work.
+
+def _pool_init(sys_path_entries, repo_path):
+    """ProcessPoolExecutor initializer. Runs once per worker process: rebuilds
+    sys.path so `import backtest` resolves the same way it did in the parent,
+    then imports backtest and binds the harness primitives into this module's
+    globals (which is what _eval_match_worker / _multi_round_worker rely on).
+
+    With the 'fork' start method (Linux default) workers already inherit the
+    parent's sys.path and imported modules — running this init is a cheap
+    no-op there. With 'spawn' (Windows; macOS Python 3.8+) workers start
+    clean and this is doing the real work."""
+    for p in sys_path_entries:
+        if p and p not in sys.path:
+            sys.path.insert(0, p)
+    if repo_path and repo_path not in sys.path:
+        sys.path.insert(0, repo_path)
+    import backtest as _bt  # noqa: WPS433  intentional lazy import in worker
+    bind_harness(_bt)
+
+
+def _eval_match_worker(payload):
+    """One eval-mode match. Pure function of its payload; no shared state with
+    the parent or other workers. Returns (i, match_result_dict) so the parent
+    can fill per-bot[i] regardless of completion order.
+
+    Builds a fresh decide_map per call — matches reload=True semantics, which
+    is the default and the only mode parallel eval supports (the dashboard
+    guards this; serial path still honors reload=False via its cached map)."""
+    (ids, id_to_path, hands, seed_base, i, rotate_seats,
+     budget, fold_on_timeout) = payload
+    seed = seed_base + i
+    order = ids[:]
+    if rotate_seats:
+        k = i % len(order)
+        order = order[k:] + order[:k]
+    else:
+        random.Random(seed * 7919 + 1).shuffle(order)
+    dm = build_decide_map({b: id_to_path[b] for b in order})
+    res = run_match_inproc(dm, hands, seed, budget=budget,
+                           fold_on_timeout=fold_on_timeout)
+    return i, res
+
+
+def _multi_round_worker(payload):
+    """One paired-multi match-index ROUND: every hero plays its sub-match
+    against the same field at the same seat on the same seed. Returns
+    (i, [(hero_id, sub_match_result), ...]) so the parent stitches results
+    back into per-hero arrays indexed by `i`.
+
+    Note on a known sub-optimality preserved from the serial code: the field
+    is reloaded N times per round (once per hero), where loading it once and
+    only swapping the hero seat would be enough. Keeping serial behavior so
+    the only thing changing here is the parallelism axis; that load-once
+    optimization is a separate follow-up."""
+    (hero_ids, hero_path, field_ids, field_map, hands, seed_base, i, n_seats,
+     budget, fold_on_timeout) = payload
+    seed = seed_base + i
+    hero_idx = i % n_seats
+    out = []
+    for hid in hero_ids:
+        order = field_ids[:]
+        order.insert(hero_idx, hid)
+        paths = {bid: (hero_path[hid] if bid == hid else field_map[bid])
+                 for bid in order}
+        dm = build_decide_map({b: paths[b] for b in order})
+        res = run_match_inproc(dm, hands, seed, budget=budget,
+                               fold_on_timeout=fold_on_timeout)
+        out.append((hid, res))
+    return i, out
+
+
+def default_workers() -> int:
+    """Conservative-but-useful default: one less than the visible CPU count,
+    floored at 1. Lets app.py pick a sensible initial value without each
+    caller redoing the os.cpu_count() dance."""
+    return max(1, (os.cpu_count() or 2) - 1)
+
+
 def _run_eval(hero_path, opponent_paths, matches, hands, seed_base,
               budget, fold_on_timeout, reload, rotate_seats,
-              progress_callback=None) -> dict:
+              progress_callback=None, workers=1, worker_repo_path=None) -> dict:
     """One hero vs a field of opponents. opponent_paths may contain duplicate
     paths — make_ids gives each a distinct id (foo, foo_2, …) and build_decide_map
     loads each under a unique module name, so duplicates seat independently with
@@ -121,45 +224,82 @@ def _run_eval(hero_path, opponent_paths, matches, hands, seed_base,
 
     Returns realized per-match deltas, EV-adjusted per-match deltas, and a
     per-bot per-match placement series (all bots share one match, so their ranks
-    are mutually consistent 1..n)."""
+    are mutually consistent 1..n).
+
+    `workers > 1` dispatches matches across a ProcessPoolExecutor. Parallel mode
+    requires reload=True (each match must build its own decide_map; reload=False
+    relies on a parent-process cache that can't be shared across workers without
+    pickling decide callables, which load_decide can't promise). When the caller
+    asks for parallel + reload=False we silently fall back to the serial path
+    rather than fail — the dashboard surfaces a warning for that combination."""
     paths = [hero_path] + list(opponent_paths)
     ids = make_ids(paths)
     hero_id = ids[0]
     id_to_path = dict(zip(ids, paths))
 
-    per_bot = {bid: [] for bid in ids}            # realized chip Δ per match
-    per_bot_ev = {bid: [] for bid in ids}         # EV-adjusted chip Δ per match
-    per_bot_placement = {bid: [] for bid in ids}  # finish rank per match
+    # Pre-allocated per-bot arrays so out-of-order future completion still
+    # produces lists indexed by match index `i`. Serial path uses the same
+    # layout for symmetry — produces identical output to the old .append() form.
+    per_bot = {bid: [None] * matches for bid in ids}           # realized chip Δ
+    per_bot_ev = {bid: [None] * matches for bid in ids}        # EV-adjusted Δ
+    per_bot_placement = {bid: [None] * matches for bid in ids} # finish rank
     errors_total: dict = {}
     timing_total: dict = {}
 
-    cached = None if reload else build_decide_map(id_to_path)
+    use_parallel = workers > 1 and reload and matches > 1
 
-    t0 = time.time()
-    for i in range(matches):
-        seed = seed_base + i
-        order = ids[:]
-        if rotate_seats:
-            k = i % len(order)
-            order = order[k:] + order[:k]
-        else:
-            random.Random(seed * 7919 + 1).shuffle(order)
-
-        dm = (build_decide_map({b: id_to_path[b] for b in order})
-              if reload else {b: cached[b] for b in order})
-
-        res = run_match_inproc(dm, hands, seed, budget=budget,
-                               fold_on_timeout=fold_on_timeout)
+    def _absorb(i, res):
+        """Common per-match folding logic — shared between serial and parallel
+        branches so they can't drift."""
         chip = res["chip_delta"]
         evd = _ev_of(res)
         for bid in ids:
-            per_bot[bid].append(chip[bid])
-            per_bot_ev[bid].append(evd.get(bid, chip[bid]))
-            per_bot_placement[bid].append(placement(bid, chip))
+            per_bot[bid][i] = chip[bid]
+            per_bot_ev[bid][i] = evd.get(bid, chip[bid])
+            per_bot_placement[bid][i] = placement(bid, chip)
         _accumulate(errors_total, timing_total, res)
 
-        if progress_callback:
-            progress_callback(i + 1, matches)
+    t0 = time.time()
+    if use_parallel:
+        n_workers = min(workers, matches)
+        payloads = [
+            (ids, id_to_path, hands, seed_base, i, rotate_seats,
+             budget, fold_on_timeout)
+            for i in range(matches)
+        ]
+        done = 0
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_pool_init,
+            initargs=(list(sys.path), worker_repo_path),
+        ) as pool:
+            futures = [pool.submit(_eval_match_worker, p) for p in payloads]
+            for fut in as_completed(futures):
+                i, res = fut.result()
+                _absorb(i, res)
+                done += 1
+                if progress_callback:
+                    progress_callback(done, matches)
+    else:
+        cached = None if reload else build_decide_map(id_to_path)
+        for i in range(matches):
+            seed = seed_base + i
+            order = ids[:]
+            if rotate_seats:
+                k = i % len(order)
+                order = order[k:] + order[:k]
+            else:
+                random.Random(seed * 7919 + 1).shuffle(order)
+
+            dm = (build_decide_map({b: id_to_path[b] for b in order})
+                  if reload else {b: cached[b] for b in order})
+
+            res = run_match_inproc(dm, hands, seed, budget=budget,
+                                   fold_on_timeout=fold_on_timeout)
+            _absorb(i, res)
+
+            if progress_callback:
+                progress_callback(i + 1, matches)
 
     elapsed = time.time() - t0
     stats = {bid: summarize(per_bot[bid], hands) for bid in ids}
@@ -176,7 +316,8 @@ def _run_eval(hero_path, opponent_paths, matches, hands, seed_base,
 
 
 def _run_multi(hero_specs, baseline_id, field_paths, matches, hands, seed_base,
-               budget, fold_on_timeout, progress_callback=None) -> dict:
+               budget, fold_on_timeout, progress_callback=None,
+               workers=1, worker_repo_path=None) -> dict:
     """Paired N-way comparison (2..7 heroes) on identical seeds, identical seat,
     identical (freshly loaded) field. Generalises the old A-vs-B path: at each
     match index every hero plays its OWN match against the same field, in the
@@ -190,7 +331,13 @@ def _run_multi(hero_specs, baseline_id, field_paths, matches, hands, seed_base,
     finish rank in its own sub-match (1..n_seats).
 
     Note: the engine's 9-seat cap applies to field + 1 hero per sub-match, NOT
-    to the number of heroes — each hero is seated alone against the field."""
+    to the number of heroes — each hero is seated alone against the field.
+
+    `workers > 1` dispatches whole match-index rounds (all heroes for one i)
+    across a ProcessPoolExecutor; per-hero per-match arrays are filled by `i`
+    (not arrival order) so the paired (hero − baseline) diff stays
+    index-aligned no matter what order futures complete in. Always safe to
+    parallelise here — multi mode is always reload-per-match by construction."""
     field_ids = make_ids(list(field_paths))
     field_map = dict(zip(field_ids, field_paths))
     n_seats = len(field_ids) + 1
@@ -208,37 +355,64 @@ def _run_multi(hero_specs, baseline_id, field_paths, matches, hands, seed_base,
     if baseline_id not in hero_path:           # baseline got disambiguated too
         baseline_id = hero_ids[0]
 
-    deltas = {hid: [] for hid in hero_ids}        # absolute realized chip Δ
-    ev_deltas = {hid: [] for hid in hero_ids}     # absolute EV-adjusted chip Δ
-    placements = {hid: [] for hid in hero_ids}    # finish rank per match
+    # Pre-allocated arrays: index-based fill survives out-of-order futures.
+    deltas = {hid: [None] * matches for hid in hero_ids}       # realized chip Δ
+    ev_deltas = {hid: [None] * matches for hid in hero_ids}    # EV-adjusted Δ
+    placements = {hid: [None] * matches for hid in hero_ids}   # finish rank
     errors_total: dict = {}
     timing_total: dict = {}
 
-    t0 = time.time()
-    for i in range(matches):
-        seed = seed_base + i
-        hero_idx = i % n_seats  # same seat for every hero at this seed
-
-        def seated(hid):
-            order = field_ids[:]
-            order.insert(hero_idx, hid)
-            paths = {bid: (hero_path[hid] if bid == hid else field_map[bid])
-                     for bid in order}
-            dm = build_decide_map({b: paths[b] for b in order})
-            return run_match_inproc(dm, hands, seed, budget=budget,
-                                    fold_on_timeout=fold_on_timeout)
-
-        for hid in hero_ids:
-            res = seated(hid)
+    def _absorb_round(i, round_results):
+        for hid, res in round_results:
             _accumulate(errors_total, timing_total, res)
             chip = res["chip_delta"]
             evd = _ev_of(res)
-            deltas[hid].append(chip[hid])
-            ev_deltas[hid].append(evd.get(hid, chip[hid]))
-            placements[hid].append(placement(hid, chip))
+            deltas[hid][i] = chip[hid]
+            ev_deltas[hid][i] = evd.get(hid, chip[hid])
+            placements[hid][i] = placement(hid, chip)
 
-        if progress_callback:
-            progress_callback(i + 1, matches)
+    use_parallel = workers > 1 and matches > 1
+
+    t0 = time.time()
+    if use_parallel:
+        n_workers = min(workers, matches)
+        payloads = [
+            (hero_ids, hero_path, field_ids, field_map, hands, seed_base, i,
+             n_seats, budget, fold_on_timeout)
+            for i in range(matches)
+        ]
+        done = 0
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_pool_init,
+            initargs=(list(sys.path), worker_repo_path),
+        ) as pool:
+            futures = [pool.submit(_multi_round_worker, p) for p in payloads]
+            for fut in as_completed(futures):
+                i, round_results = fut.result()
+                _absorb_round(i, round_results)
+                done += 1
+                if progress_callback:
+                    progress_callback(done, matches)
+    else:
+        for i in range(matches):
+            seed = seed_base + i
+            hero_idx = i % n_seats  # same seat for every hero at this seed
+
+            def seated(hid):
+                order = field_ids[:]
+                order.insert(hero_idx, hid)
+                paths = {bid: (hero_path[hid] if bid == hid else field_map[bid])
+                         for bid in order}
+                dm = build_decide_map({b: paths[b] for b in order})
+                return run_match_inproc(dm, hands, seed, budget=budget,
+                                        fold_on_timeout=fold_on_timeout)
+
+            round_results = [(hid, seated(hid)) for hid in hero_ids]
+            _absorb_round(i, round_results)
+
+            if progress_callback:
+                progress_callback(i + 1, matches)
 
     elapsed = time.time() - t0
 

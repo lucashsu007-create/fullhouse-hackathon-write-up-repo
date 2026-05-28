@@ -1,1 +1,29 @@
+pull github -> local
+-----------------
+cd ~/projects/fullhouse-hackathon-write-up-repo && \
+git status -sb && \
+git pull --rebase origin main && \
+git status -sb
 
+----------------------------------------------------
+push local -> github
+-----------------
+cd ~/projects/fullhouse-hackathon-write-up-repo && \
+rm -f bots/*:Zone.Identifier && \
+git status -sb && \
+git add -A && \
+git commit -m "Update latest Fullhouse bot version and results" && \
+git pull --rebase origin main && \
+git push && \
+git status -sb
+--------------------------------------------------
+if says " nothing to commit "
+---------------
+cd ~/projects/fullhouse-hackathon-write-up-repo && \
+git pull --rebase origin main && \
+git push && \
+git status -sb
+------------
+good final state:
+-------
+## main...origin/main

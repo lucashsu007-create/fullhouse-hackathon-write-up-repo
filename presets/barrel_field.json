@@ -1,0 +1,10 @@
+{
+  "name": "barrel_field",
+  "bot_ids": [
+    "multi_barrel",
+    "balanced_lag",
+    "multi_barrel",
+    "balanced_lag",
+    "squeezer"
+  ]
+}

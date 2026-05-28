@@ -1,0 +1,10 @@
+{
+  "name": "adaptive_test",
+  "bot_ids": [
+    "adaptive_exploit",
+    "competent_tag",
+    "balanced_tag",
+    "gto_balanced",
+    "balanced_lag"
+  ]
+}

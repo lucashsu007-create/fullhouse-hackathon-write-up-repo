@@ -1,0 +1,10 @@
+{
+  "name": "wall_balanced",
+  "bot_ids": [
+    "gto_balanced",
+    "cfr_trained",
+    "gto_balanced",
+    "cfr_trained",
+    "competent_tag"
+  ]
+}

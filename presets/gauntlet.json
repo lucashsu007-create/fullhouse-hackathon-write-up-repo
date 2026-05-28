@@ -1,1 +1,10 @@
-{"name":"gauntlet","bot_ids":["competent_tag","balanced_lag","multi_barrel","gto_balanced","check_raiser","calling_station"]}
+{
+  "name": "gauntlet",
+  "bot_ids": [
+    "competent_tag",
+    "balanced_lag",
+    "overbet_polar",
+    "trap_tag",
+    "check_raiser"
+  ]
+}

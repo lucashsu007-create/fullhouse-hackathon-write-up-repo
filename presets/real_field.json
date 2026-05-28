@@ -1,1 +1,10 @@
-{"name":"real_field","bot_ids":["competent_tag","polar_3bettor","multi_barrel","balanced_lag"]}
+{
+  "name": "real_field",
+  "bot_ids": [
+    "competent_tag",
+    "balanced_lag",
+    "multi_barrel",
+    "polar_3bettor",
+    "balanced_tag"
+  ]
+}

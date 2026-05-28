@@ -1,0 +1,10 @@
+{
+  "name": "trap_field",
+  "bot_ids": [
+    "trap_tag",
+    "check_raiser",
+    "trap_tag",
+    "check_raiser",
+    "trap_tag"
+  ]
+}

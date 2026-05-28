@@ -1,0 +1,10 @@
+{
+  "name": "broad_mix",
+  "bot_ids": [
+    "calling_station",
+    "nit_folder",
+    "multi_barrel",
+    "gto_balanced",
+    "min_ball"
+  ]
+}

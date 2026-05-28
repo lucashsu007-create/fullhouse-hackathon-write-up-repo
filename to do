@@ -1,0 +1,42 @@
+## To-do — pre-deadline (May 31)
+
+**Tonight**
+- [ ] Patch `_position(state)` to derive from `_seat_positions(state)` instead of raw `seat_to_act / (n−1)`. Single-line change.
+- [ ] Bundle: add `eq >= req` gate to the 0.72+ call branch in `_postflop_by_equity`. Trivial defensive fix.
+- [ ] AB the bundled candidate vs V7-M2 (fix) on full panel. Promote if floor ≥ 0.
+
+**Tomorrow**
+- [ ] Design tighter OOP tables for `_DEFENSE_TABLES`: take existing `_VS_EARLY/MIDDLE/LATE`, halve call frequencies for marginal hands (30–50% call), keep value combos. AB it.
+- [ ] If positive → sweep tighter and pick winner. If negative → revert and move on.
+- [ ] Fix `_equity_vs_multi_range` failed-iteration bias (separate `attempts` vs `iters` counters) — bundle into whichever variant you're editing anyway.
+
+**Before submission**
+- [ ] Add position-conditional dispatch *structure* to `_VS_3BET` (all positions still point at one shared table for D1 — D2 swaps in differentiated tables). Refactor only, no behavior change.
+- [ ] Save `[load_decide] BOT_NAME=...` stderr from final AB run as deployment verification.
+- [ ] Ship.
+
+**Defer / skip**
+- Bugs #3, #4, #7, #8, #9, #10, #11 — not worth pre-deadline cycles.
+
+---
+
+## To-do — patch window (June 2–4)
+
+**Before D1 ends, set up:**
+- [ ] Hand-history JSON parser ready to ingest the D2 dump.
+- [ ] Per-opponent override scaffold in `bot.py`:
+  ```python
+  OPPONENT_EXPLOITS = {}  # populated D2 from log analysis
+  def _exploit_override(state, base_decision): ...
+  ```
+- [ ] Parameter-sensitivity baseline: coarse AB sweeps on the 5–6 numeric parameters that plausibly matter (0.72 / 0.55 cutoffs, +0.06 commitment premium, open sizes per position, c-bet sizing). Goal: know which dials move bb/100 before D2.
+
+**When D2 data drops (June 2):**
+- [ ] Parse D1 logs → identify likely D5 opponents by bot ID.
+- [ ] Per-opponent leak detection: fold-to-3bet rates, VPIP, c-bet response, etc.
+- [ ] Fill `OPPONENT_EXPLOITS` with specific dictionary entries per opponent.
+- [ ] Differentiate `_VS_3BET` tables by opener position (the structural-but-deferred lever).
+- [ ] Sizing menu work (conditional c-bet sizes by board texture, against specific opponents).
+- [ ] Mixed-strategy postflop adjustments where the data justifies them.
+
+**Submit patched bot before D5.**

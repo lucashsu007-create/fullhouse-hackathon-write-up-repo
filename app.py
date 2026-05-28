@@ -1,20 +1,39 @@
 """
-app.py — Streamlit dashboard wrapping backtest.py's eval mode.
+app.py — Streamlit dashboard for backtest.py (self-contained orchestration).
 
 Run from the directory that contains this file and backtest.py:
 
     pip install streamlit
     streamlit run app.py
 
+This version does NOT depend on backtest.py exposing run_eval()/run_ab().
+It imports the building blocks that backtest.py defines —
+    make_ids, build_decide_map, run_match_inproc, summarize
+— and performs the eval / paired-AB orchestration locally (see _run_eval /
+_run_ab below). That mirrors backtest.py's own cmd_eval / cmd_ab logic exactly,
+match-for-match, while also returning the richer result shape this dashboard's
+Results tab needs (per-match deltas, per-bot crash/timing counts) and threading
+a per-match progress callback.
+
+Two correctness fixes over the previous revision:
+  1. Duplicate seats are preserved. A preset like
+     sizing_sweep = [min_ball, min_ball, overbet_polar, overbet_polar, ...]
+     used to collapse to one of each because the field was routed through a
+     st.multiselect (which is set-like). Now a chosen preset feeds its bot_ids
+     list straight into the job, duplicates intact, so a 6-bot padded preset
+     really seats 6 + the hero. Manual field building (no preset) still uses the
+     multiselect, where de-duplication is harmless.
+  2. Seat-count guard. The engine asserts 2..9 players, so hero + opponents must
+     be <= 9. Oversized fields (e.g. a 10-bot preset) are rejected up front with
+     a clear message instead of an opaque AssertionError buried in a result.
+
 The dashboard creates three folders next to itself on first run:
     bots/      bot library  (one subdir per bot, each containing bot.py)
     presets/   named opponent tables (JSON files)
     results/   one JSON per completed backtest run
 
-You can also point any of those at custom paths in the sidebar.
-
-The engine repo (the one containing `engine/game.py`) must be importable.
-Either run this app from inside the repo, or set the repo path in the sidebar.
+The engine repo (the one containing engine/game.py) must be importable: run
+this from inside the repo, or set the repo path in the sidebar.
 """
 
 from __future__ import annotations
@@ -22,6 +41,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import random
 import secrets
 import sys
 import time
@@ -41,6 +61,10 @@ except Exception:
     _HAS_MPL = False
 
 
+# Engine seat cap (PokerEngine asserts 2 <= players <= MAX_PLAYERS, MAX=9).
+MAX_SEATS = 9
+
+
 # ---------------------------------------------------------------------------
 # Paths / session state
 # ---------------------------------------------------------------------------
@@ -55,12 +79,9 @@ def _pick_default_bots_dir() -> Path:
     launched from inside WSL itself). Falls back to ./bots next to app.py if
     neither is reachable — e.g. running on a different machine."""
     candidates = [
-        # Launched from inside WSL → native Linux path
         Path("/home/lucas/projects/fullhouse-hackathon-write-up-repo/bots/custom"),
-        # Launched from Windows → UNC mirror of the WSL filesystem
         Path(r"\\wsl.localhost\Ubuntu\home\lucas\projects"
              r"\fullhouse-hackathon-write-up-repo\bots\custom"),
-        # Last-resort fallback so the dashboard is still usable elsewhere
         APP_DIR / "bots",
     ]
     for c in candidates:
@@ -68,8 +89,6 @@ def _pick_default_bots_dir() -> Path:
             if c.is_dir():
                 return c
         except (OSError, ValueError):
-            # Path constructed for the wrong OS sometimes raises on probe;
-            # treat those as "doesn't exist" and move on.
             continue
     return APP_DIR / "bots"
 
@@ -80,25 +99,40 @@ DEFAULT_RESULTS_DIR = APP_DIR / "results"
 
 
 def _bootstrap_presets(presets_dir) -> None:
-    """One-time seed of common opponent tables. No-op if presets_dir already
-    has any *.json — never overwrites user-defined presets."""
+    """One-time seed of opponent tables. No-op if presets_dir already has any
+    *.json — never overwrites user-defined presets. All lineups are <= 8 bots
+    so hero + field fits the engine's 9-seat cap."""
     p = Path(presets_dir)
     if p.exists() and any(p.glob("*.json")):
         return
     p.mkdir(parents=True, exist_ok=True)
     bootstrap = {
-        "mixed_7":     ["simple_tag", "balanced_tag", "trap_tag", "nit_folder",
-                        "calling_station", "mc_pot_odds", "perma_jam"],
-        "real_field":  ["competent_tag", "polar_3bettor", "multi_barrel"],
-        "extended_10": ["simple_tag", "balanced_tag", "trap_tag", "nit_folder",
-                        "calling_station", "mc_pot_odds", "perma_jam",
-                        "competent_tag", "polar_3bettor", "multi_barrel"],
+        # Diagnostics — each isolates one leak. Padded to 6 by duplication so
+        # the table stays full and the probe hits hard.
+        "sizing_sweep": ["min_ball", "min_ball", "overbet_polar",
+                         "overbet_polar", "check_raiser", "check_raiser"],
+        "aggression":   ["balanced_lag", "multi_barrel", "squeezer",
+                         "polar_3bettor", "balanced_lag", "multi_barrel"],
+        "balanced":     ["competent_tag", "gto_balanced", "cfr_trained",
+                         "competent_tag", "gto_balanced", "cfr_trained"],
+        "passive":      ["calling_station", "nit_folder", "limper",
+                         "mc_pot_odds", "calling_station", "limper"],
+        # One adaptive seat only — duplicates would split the read across
+        # independent trackers and slow convergence.
+        "adaptive":     ["adaptive_exploit", "competent_tag", "balanced_tag",
+                         "calling_station", "nit_folder", "balanced_lag"],
+        # Composites — natural sizes.
+        "real_field":   ["competent_tag", "polar_3bettor", "multi_barrel",
+                         "balanced_lag"],
+        "gauntlet":     ["competent_tag", "balanced_lag", "multi_barrel",
+                         "gto_balanced", "check_raiser", "calling_station"],
+        # Legacy / stress, kept for result continuity.
+        "mixed_7":       ["simple_tag", "balanced_tag", "trap_tag", "nit_folder",
+                          "calling_station", "mc_pot_odds", "perma_jam"],
         "perma_heavy":   ["perma_jam"] * 5 + ["simple_tag"],
         "station_heavy": ["calling_station"] * 5 + ["simple_tag"],
         "folder_heavy":  ["nit_folder"] * 5 + ["simple_tag"],
     }
-    # Inline timestamp because _now_iso() is defined later in the file and
-    # this runs at module-level via _init_state().
     now_iso = dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
     for name, bots in bootstrap.items():
         (p / f"{name}.json").write_text(json.dumps({
@@ -116,9 +150,6 @@ def _init_state() -> None:
     ss.setdefault("presets_dir", str(DEFAULT_PRESETS_DIR))
     ss.setdefault("results_dir", str(DEFAULT_RESULTS_DIR))
     ss.setdefault("queue", [])           # list of job dicts
-    ss.setdefault("selected_preset", "") # for the config form
-    # Seed the default presets dir on first run. Cheap to call on every
-    # rerun; the function early-returns once any *.json exists.
     _bootstrap_presets(ss["presets_dir"])
 
 
@@ -147,13 +178,11 @@ with st.sidebar:
     st.session_state.presets_dir = st.text_input("Presets dir", value=st.session_state.presets_dir)
     st.session_state.results_dir = st.text_input("Results dir", value=st.session_state.results_dir)
 
-    for p in (st.session_state.bots_dir,
-              st.session_state.presets_dir,
-              st.session_state.results_dir):
-        Path(p).mkdir(parents=True, exist_ok=True)
+    for _p in (st.session_state.bots_dir,
+               st.session_state.presets_dir,
+               st.session_state.results_dir):
+        Path(_p).mkdir(parents=True, exist_ok=True)
 
-    # Tiny status line so you can see at a glance whether the WSL path was
-    # found or whether the dashboard fell back to ./bots.
     _bd = Path(st.session_state.bots_dir)
     if _bd.is_dir():
         _n_bots = sum(1 for s in _bd.iterdir() if s.is_dir() and (s / "bot.py").is_file())
@@ -168,6 +197,9 @@ with st.sidebar:
 # Import backtest (after the sidebar so the user can set repo_path first)
 # ---------------------------------------------------------------------------
 
+_REQUIRED_PRIMITIVES = ("make_ids", "build_decide_map", "run_match_inproc", "summarize")
+
+
 def _import_backtest():
     if st.session_state.repo_path:
         rp = os.path.abspath(st.session_state.repo_path)
@@ -177,22 +209,166 @@ def _import_backtest():
         sys.path.insert(0, str(APP_DIR))
     try:
         import backtest as bt  # noqa: WPS433  intentional lazy import
-        return bt
     except Exception as exc:
         return exc
+    missing = [n for n in _REQUIRED_PRIMITIVES if not hasattr(bt, n)]
+    if missing:
+        return RuntimeError(
+            "backtest.py imported but is missing required primitives: "
+            + ", ".join(missing)
+            + ". This dashboard drives backtest.py through those functions; "
+              "make sure you're pointing at the harness that defines them."
+        )
+    return bt
 
 
 _bt = _import_backtest()
 if isinstance(_bt, Exception):
     st.title("Fullhouse Backtest Dashboard")
     st.error(
-        "Couldn't import `backtest.py` / `engine.game`.\n\n"
+        "Couldn't import `backtest.py` / `engine.game`, or it lacks the needed "
+        "primitives.\n\n"
         f"`{type(_bt).__name__}: {_bt}`\n\n"
         "Fix: set the **Engine repo path** in the sidebar, or place this file "
         "next to `backtest.py` inside the fullhouse engine repo."
     )
     st.stop()
 bt = _bt
+
+
+# ---------------------------------------------------------------------------
+# Local eval / AB orchestration (mirrors backtest.cmd_eval / cmd_ab exactly,
+# but returns the richer dashboard result shape and reports per-match progress)
+# ---------------------------------------------------------------------------
+
+def _hero_label(prefix: str, path: str) -> str:
+    """Same labelling backtest.cmd_ab uses: file stem, or parent dir when the
+    file is the conventional bot.py."""
+    pp = Path(path)
+    name = pp.stem
+    if name in ("bot",):
+        name = pp.parent.name or name
+    return prefix + name
+
+
+def _accumulate(dst_err, dst_tim, res):
+    """Fold one match's per-bot errors/timing into running totals."""
+    for bid, c in (res.get("errors") or {}).items():
+        dst_err[bid] = dst_err.get(bid, 0) + c
+    for bid, tinfo in (res.get("timing") or {}).items():
+        agg = dst_tim.setdefault(bid, {"max": 0.0, "slow": 0})
+        agg["max"] = max(agg["max"], (tinfo or {}).get("max", 0.0))
+        agg["slow"] += (tinfo or {}).get("slow", 0)
+
+
+def _run_eval(hero_path, opponent_paths, matches, hands, seed_base,
+              budget, fold_on_timeout, reload, rotate_seats,
+              progress_callback=None) -> dict:
+    """One hero vs a field of opponents. opponent_paths may contain duplicate
+    paths — make_ids gives each a distinct id (foo, foo_2, …) and build_decide_map
+    loads each under a unique module name, so duplicates seat independently with
+    independent state. Mirrors backtest.cmd_eval's seating/seeding."""
+    paths = [hero_path] + list(opponent_paths)
+    ids = bt.make_ids(paths)
+    hero_id = ids[0]
+    id_to_path = dict(zip(ids, paths))
+
+    per_bot = {bid: [] for bid in ids}
+    errors_total: dict = {}
+    timing_total: dict = {}
+
+    cached = None if reload else bt.build_decide_map(id_to_path)
+
+    t0 = time.time()
+    for i in range(matches):
+        seed = seed_base + i
+        order = ids[:]
+        if rotate_seats:
+            k = i % len(order)
+            order = order[k:] + order[:k]
+        else:
+            random.Random(seed * 7919 + 1).shuffle(order)
+
+        dm = (bt.build_decide_map({b: id_to_path[b] for b in order})
+              if reload else {b: cached[b] for b in order})
+
+        res = bt.run_match_inproc(dm, hands, seed, budget=budget,
+                                  fold_on_timeout=fold_on_timeout)
+        for bid, d in res["chip_delta"].items():
+            per_bot[bid].append(d)
+        _accumulate(errors_total, timing_total, res)
+
+        if progress_callback:
+            progress_callback(i + 1, matches)
+
+    elapsed = time.time() - t0
+    stats = {bid: bt.summarize(per_bot[bid], hands) for bid in ids}
+    return {
+        "elapsed_s": round(elapsed, 2),
+        "hero_id": hero_id,
+        "stats": stats,
+        "per_match_deltas": per_bot,
+        "errors": errors_total,
+        "timing": timing_total,
+    }
+
+
+def _run_ab(a_path, b_path, field_paths, matches, hands, seed_base,
+            budget, fold_on_timeout, progress_callback=None) -> dict:
+    """Paired A-vs-B on identical seeds, identical seat, identical (freshly
+    loaded) opponents. Mirrors backtest.cmd_ab. field_paths may contain
+    duplicates; they seat independently."""
+    field_ids = bt.make_ids(list(field_paths))
+    field_map = dict(zip(field_ids, field_paths))
+    a_id = _hero_label("A:", a_path)
+    b_id = _hero_label("B:", b_path)
+    if a_id == b_id:
+        a_id, b_id = a_id + "#1", b_id + "#2"
+    n_seats = len(field_ids) + 1
+
+    a_deltas, b_deltas, paired = [], [], []
+    errors_total: dict = {}
+    timing_total: dict = {}
+
+    t0 = time.time()
+    for i in range(matches):
+        seed = seed_base + i
+        hero_idx = i % n_seats  # same seat for A and B at this seed
+
+        def seated(hid, hpath):
+            order = field_ids[:]
+            order.insert(hero_idx, hid)
+            paths = {bid: (hpath if bid == hid else field_map[bid])
+                     for bid in order}
+            dm = bt.build_decide_map({b: paths[b] for b in order})
+            return bt.run_match_inproc(dm, hands, seed, budget=budget,
+                                       fold_on_timeout=fold_on_timeout)
+
+        ra = seated(a_id, a_path)
+        rb = seated(b_id, b_path)
+        _accumulate(errors_total, timing_total, ra)
+        _accumulate(errors_total, timing_total, rb)
+
+        a_deltas.append(ra["chip_delta"][a_id])
+        b_deltas.append(rb["chip_delta"][b_id])
+        paired.append(a_deltas[-1] - b_deltas[-1])
+
+        if progress_callback:
+            progress_callback(i + 1, matches)
+
+    elapsed = time.time() - t0
+    sa = bt.summarize(a_deltas, hands)
+    sb = bt.summarize(b_deltas, hands)
+    sd = bt.summarize(paired, hands)
+    t_stat = (sd["mean_delta"] / sd["stderr"]) if sd["stderr"] else 0.0
+    return {
+        "elapsed_s": round(elapsed, 2),
+        "stats": {"A": sa, "B": sb, "A_minus_B": sd},
+        "t_stat": t_stat,
+        "per_match_deltas": {"A": a_deltas, "B": b_deltas, "A_minus_B": paired},
+        "errors": errors_total,
+        "timing": timing_total,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +435,6 @@ def list_presets(presets_dir: str) -> list[dict]:
                 "created_at": data.get("created_at"),
             })
         except Exception:
-            # Ignore broken preset files but keep the rest usable
             pass
     return out
 
@@ -281,6 +456,19 @@ def delete_preset(presets_dir: str, name: str) -> None:
         p.unlink()
 
 
+def resolve_preset_field(preset: dict, bot_ids: list[str],
+                         excluded_ids: set) -> tuple[list[str], list[str]]:
+    """Filter a preset's raw bot_ids to ones that exist and aren't a hero —
+    PRESERVING ORDER AND DUPLICATES. Returns (kept, dropped)."""
+    kept, dropped = [], []
+    for b in (preset.get("bot_ids") or []):
+        if b in bot_ids and b not in excluded_ids:
+            kept.append(b)
+        else:
+            dropped.append(b)
+    return kept, dropped
+
+
 # ---------------------------------------------------------------------------
 # Jobs / queue
 # ---------------------------------------------------------------------------
@@ -295,8 +483,6 @@ def _now_iso() -> str:
 
 
 def _base_job(mode: str, label: str, preset_name: str | None, params: dict) -> dict:
-    """Common scaffolding for every job dict. Mode-specific keys are added by
-    the callers (make_eval_job / make_ab_job)."""
     return {
         "job_id": _new_job_id(),
         "label": label,
@@ -309,15 +495,11 @@ def _base_job(mode: str, label: str, preset_name: str | None, params: dict) -> d
         "completed_at": None,
         "elapsed_s": None,
         "result_path": None,
-        "error": None,                 # {type, message, traceback} or None
+        "error": None,
     }
 
 
-def make_eval_job(label: str,
-                  hero: dict,
-                  opponents: list[dict],
-                  preset_name: str | None,
-                  params: dict) -> dict:
+def make_eval_job(label, hero, opponents, preset_name, params) -> dict:
     if not label:
         label = f"{hero['id']} vs {len(opponents)} opp(s)"
     job = _base_job("eval", label, preset_name, params)
@@ -326,12 +508,7 @@ def make_eval_job(label: str,
     return job
 
 
-def make_ab_job(label: str,
-                hero_a: dict,
-                hero_b: dict,
-                opponents: list[dict],
-                preset_name: str | None,
-                params: dict) -> dict:
+def make_ab_job(label, hero_a, hero_b, opponents, preset_name, params) -> dict:
     if not label:
         label = f"A:{hero_a['id']} vs B:{hero_b['id']} on {len(opponents)} field"
     job = _base_job("ab", label, preset_name, params)
@@ -341,27 +518,20 @@ def make_ab_job(label: str,
     return job
 
 
-def write_result_json(job: dict,
-                      results_dir: str,
-                      result: dict | None,
-                      error: dict | None) -> Path:
-    """Persist one JSON per job. Shape depends on job["mode"]:
+def out_path_safe(obj):
+    """Replace NaN/Inf with None so the output is valid JSON."""
+    if isinstance(obj, dict):
+        return {k: out_path_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [out_path_safe(v) for v in obj]
+    if isinstance(obj, float):
+        if obj != obj or obj in (float("inf"), float("-inf")):
+            return None
+    return obj
 
-    Both modes share at top level:
-        schema_version, metadata{job_id,label,mode,created_at,started_at,completed_at},
-        mode, opponents, preset_name, params, elapsed_s, error,
-        stats, per_match_deltas, errors_per_bot, timing_per_bot
 
-    Eval-only:
-        hero{id,path}
-        stats: {bot_id: summarize(...)}
-        per_match_deltas: {bot_id: [...]}
-
-    Ab-only:
-        hero_a{id,path}, hero_b{id,path}, t_stat
-        stats: {"A": ..., "B": ..., "A_minus_B": ...}
-        per_match_deltas: {"A": [...], "B": [...], "A_minus_B": [...]}
-    """
+def write_result_json(job, results_dir, result, error) -> Path:
+    """Persist one JSON per job (schema_version 2)."""
     base = {
         "schema_version": 2,
         "metadata": {
@@ -395,29 +565,14 @@ def write_result_json(job: dict,
     return out_path
 
 
-def out_path_safe(obj):
-    """JSON values can include numpy / non-finite floats in unusual cases.
-    Pass-through for normal types; replace NaN/Inf with None to keep the
-    output valid JSON."""
-    if isinstance(obj, dict):
-        return {k: out_path_safe(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [out_path_safe(v) for v in obj]
-    if isinstance(obj, float):
-        if obj != obj or obj in (float("inf"), float("-inf")):
-            return None
-    return obj
-
-
-def run_job(job: dict, results_dir: str, progress_callback=None) -> None:
-    """Execute one job. Always writes a result JSON, even on failure.
-    Mutates the job dict in place with status / timing / paths."""
+def run_job(job, results_dir, progress_callback=None) -> None:
+    """Execute one job. Always writes a result JSON, even on failure."""
     job["status"] = "running"
     job["started_at"] = _now_iso()
     try:
         params = job["params"]
         if job["mode"] == "eval":
-            result = bt.run_eval(
+            result = _run_eval(
                 hero_path=job["hero"]["path"],
                 opponent_paths=[o["path"] for o in job["opponents"]],
                 matches=params["matches"],
@@ -430,7 +585,7 @@ def run_job(job: dict, results_dir: str, progress_callback=None) -> None:
                 progress_callback=progress_callback,
             )
         elif job["mode"] == "ab":
-            result = bt.run_ab(
+            result = _run_ab(
                 a_path=job["hero_a"]["path"],
                 b_path=job["hero_b"]["path"],
                 field_paths=[o["path"] for o in job["opponents"]],
@@ -462,8 +617,7 @@ def run_job(job: dict, results_dir: str, progress_callback=None) -> None:
         job["status"] = "error"
 
 
-def _fmt_dur(seconds: float | None) -> str:
-    """Compact human-readable duration: '5s', '1m 24s', '1h 03m'."""
+def _fmt_dur(seconds) -> str:
     if seconds is None or seconds < 0 or seconds != seconds:  # NaN guard
         return "?"
     seconds = int(round(seconds))
@@ -482,7 +636,7 @@ def _fmt_dur(seconds: float | None) -> str:
 # ---------------------------------------------------------------------------
 
 st.title("Fullhouse Backtest Dashboard")
-st.caption("Wraps `backtest.py` eval mode. Sequential run queue, one JSON per run.")
+st.caption("Drives `backtest.py` in-process. Sequential run queue, one JSON per run.")
 
 tab_setup, tab_run, tab_results = st.tabs(
     ["1 · Bots & Presets", "2 · Configure & Queue", "3 · Results"]
@@ -549,8 +703,10 @@ with tab_setup:
         else:
             st.write(f"{len(presets)} preset(s):")
             for p in presets:
+                seats = len(p["bot_ids"]) + 1
+                flag = "  ⚠ too big" if seats > MAX_SEATS else ""
                 c1, c2, c3 = st.columns([3, 6, 1])
-                c1.markdown(f"**{p['name']}**")
+                c1.markdown(f"**{p['name']}**  \n`{seats} seats{flag}`")
                 c2.caption(", ".join(p["bot_ids"]) or "(empty)")
                 if c3.button("✕", key=f"del_preset_{p['name']}", help="Delete preset"):
                     delete_preset(st.session_state.presets_dir, p["name"])
@@ -558,28 +714,42 @@ with tab_setup:
 
         st.markdown("---")
         st.markdown("**Save a new preset**")
+        st.caption("Duplicates are allowed and are preserved as separate seats. "
+                   "Add a bot twice in the box below to pad a table.")
         bot_ids = [b["id"] for b in bots]
         new_preset_name = st.text_input(
             "Preset name",
             key="new_preset_name",
             placeholder="e.g. mixed, trappy, nit",
         )
+        # multiselect can't express duplicates, so offer an explicit "repeat"
+        # control for padding a probe lineup.
         new_preset_bots = st.multiselect(
-            "Bots in this preset",
+            "Bots in this preset (unique members)",
             options=bot_ids,
             key="new_preset_bots",
         )
+        repeat_n = st.number_input(
+            "Repeat each selected bot ×N (1 = no padding)",
+            min_value=1, max_value=8, value=1, step=1, key="new_preset_repeat",
+            help="e.g. pick min_ball + overbet_polar + check_raiser and ×2 to "
+                 "build the padded sizing_sweep lineup (6 seats).",
+        )
         if st.button("Save preset", key="save_preset"):
             name = (new_preset_name or "").strip()
+            expanded = [b for b in new_preset_bots for _ in range(int(repeat_n))]
             if not name:
                 st.error("Give the preset a name.")
             elif any(c in name for c in r"\/:*?\"<>| "):
                 st.error("Preset name can't contain spaces or path separators.")
             elif not new_preset_bots:
                 st.error("Pick at least one bot.")
+            elif len(expanded) + 1 > MAX_SEATS:
+                st.error(f"{len(expanded)} bots + hero = {len(expanded)+1} seats "
+                         f"exceeds the engine max of {MAX_SEATS}. Trim the lineup.")
             else:
-                save_preset(st.session_state.presets_dir, name, new_preset_bots)
-                st.success(f"Saved preset `{name}` ({len(new_preset_bots)} bots).")
+                save_preset(st.session_state.presets_dir, name, expanded)
+                st.success(f"Saved preset `{name}` ({len(expanded)} seats of bots).")
                 st.rerun()
 
 
@@ -623,39 +793,56 @@ with tab_run:
             hero_id = None
             excluded_ids = {hero_a_id, hero_b_id}
 
-        # ----- Opponents / Field (via preset or manual) -----
+        # ----- Field: preset (authoritative, dups preserved) OR manual -----
         preset_names = [""] + [p["name"] for p in presets]
         opps_label = "Opponents" if mode == "eval" else "Field"
         preset_choice = st.selectbox(
-            f"Preset (optional — prefills {opps_label.lower()})",
+            f"Preset ({opps_label.lower()} source)",
             options=preset_names,
             key="cfg_preset",
-            format_func=lambda s: "(none)" if s == "" else s,
+            format_func=lambda s: "(none) — build manually below" if s == "" else s,
         )
 
-        # When the user picks a preset, prefill the multiselect — but recompute
-        # this if the mode or hero(es) changed, since exclusion changes too.
-        sig = (preset_choice, mode, hero_id, hero_a_id, hero_b_id)
-        if preset_choice and sig != st.session_state.get("_last_preset_sig"):
+        dropped_from_preset: list[str] = []
+        if preset_choice:
             preset = next((p for p in presets if p["name"] == preset_choice), None)
-            if preset:
-                st.session_state["cfg_opponents"] = [
-                    b for b in preset["bot_ids"]
-                    if b in bot_ids and b not in excluded_ids
-                ]
-        st.session_state["_last_preset_sig"] = sig
+            effective_field, dropped_from_preset = (
+                resolve_preset_field(preset, bot_ids, excluded_ids)
+                if preset else ([], [])
+            )
+            st.caption(
+                f"Field is taken straight from preset **{preset_choice}** — "
+                "duplicate seats are preserved. Pick “(none)” to build a field by hand."
+            )
+            # Show the manual picker disabled, as a read-only hint of members.
+            st.multiselect(
+                f"{opps_label} (from preset — read-only)",
+                options=sorted(set(effective_field)),
+                default=sorted(set(effective_field)),
+                key="cfg_opponents_ro",
+                disabled=True,
+            )
+        else:
+            effective_field = st.multiselect(
+                opps_label,
+                options=[b for b in bot_ids if b not in excluded_ids],
+                key="cfg_opponents",
+                help="Manual field. (A multiselect can't hold duplicates — to "
+                     "pad with repeats, save a preset in Tab 1 and pick it here.)",
+            )
 
-        # Default and always-filter: keep heroes out of the field.
-        st.session_state.setdefault("cfg_opponents", [])
-        st.session_state["cfg_opponents"] = [
-            b for b in st.session_state["cfg_opponents"]
-            if b in bot_ids and b not in excluded_ids
-        ]
-        opponent_ids = st.multiselect(
-            opps_label,
-            options=[b for b in bot_ids if b not in excluded_ids],
-            key="cfg_opponents",
-        )
+        # Field preview + seat-count guard.
+        n_seats = len(effective_field) + 1
+        seat_ok = (1 <= len(effective_field)) and (n_seats <= MAX_SEATS)
+        preview = ", ".join(effective_field) if effective_field else "(empty)"
+        st.caption(f"Effective {opps_label.lower()}: {preview}  ·  **{n_seats} seats** "
+                   f"incl. hero")
+        if dropped_from_preset:
+            st.caption("Dropped from preset (unknown bot, or it's a selected hero): "
+                       + ", ".join(sorted(set(dropped_from_preset))))
+        if effective_field and n_seats > MAX_SEATS:
+            st.warning(f"{n_seats} seats exceeds the engine cap of {MAX_SEATS}. "
+                       f"Use at most {MAX_SEATS - 1} {opps_label.lower()}.")
 
         # ----- Params -----
         st.markdown("**Parameters**")
@@ -673,13 +860,11 @@ with tab_run:
             "Fold on timeout", value=True, key="cfg_fot",
             help="Auto-fold actions over the budget (matches tournament rules).",
         )
-        # reload + rotate_seats are eval-only knobs. ab mode always reloads
-        # fresh modules per match (the paired test depends on that), and seat
-        # rotation is replaced by the deterministic same-seat-for-A-and-B logic.
         if mode == "eval":
             reload_each = pc6.checkbox(
                 "Reload bots per match", value=True, key="cfg_reload",
-                help="Fresh module load per match — safer for stateful bots.",
+                help="Fresh module load per match — required for stateful bots "
+                     "(e.g. adaptive_exploit) to reset between matches.",
             )
             rotate = st.checkbox(
                 "Deterministic seat rotation",
@@ -699,7 +884,6 @@ with tab_run:
                          else f"e.g. {hero_a_id} vs {hero_b_id} on {preset_choice or 'field'}"),
         )
 
-        # Build the params dict once — reused by both single-add and sweep.
         params = {
             "matches": int(matches),
             "hands": int(hands),
@@ -713,12 +897,15 @@ with tab_run:
 
         # ----- Add single job -----
         if st.button("Add to queue", type="primary", key="add_to_queue"):
-            if not opponent_ids:
+            if not effective_field:
                 st.error(f"Pick at least one {'opponent' if mode == 'eval' else 'field bot'}.")
+            elif n_seats > MAX_SEATS:
+                st.error(f"{n_seats} seats exceeds the engine cap of {MAX_SEATS}. "
+                         f"Trim to ≤{MAX_SEATS - 1} {opps_label.lower()}.")
             elif mode == "ab" and hero_a_id == hero_b_id:
                 st.error("Hero A and Hero B must be different bots.")
             else:
-                opponents = [bot_by_id[b] for b in opponent_ids]
+                opponents = [bot_by_id[b] for b in effective_field]  # dups kept
                 if mode == "eval":
                     job = make_eval_job(
                         label=label or "",
@@ -742,9 +929,9 @@ with tab_run:
         # ----- Batch sweep -----
         with st.expander("Batch sweep across presets"):
             st.caption(
-                "Queue one job per selected preset. Uses the current mode, "
-                "hero(es), and parameters above. Each preset's bots become "
-                "that job's "
+                "Queue one job per selected preset (duplicates preserved). Uses "
+                "the current mode, hero(es), and parameters above. Each preset's "
+                "bots become that job's "
                 + ("opponents." if mode == "eval" else "field.")
             )
             if not presets:
@@ -771,17 +958,19 @@ with tab_run:
                     key="queue_sweep",
                 ):
                     added = 0
-                    skipped = []
+                    skipped_empty, skipped_big = [], []
                     for pname in sweep_choices:
                         preset = next((p for p in presets if p["name"] == pname), None)
                         if not preset:
                             continue
-                        opp_ids = [b for b in preset["bot_ids"]
-                                   if b in bot_ids and b not in excluded_ids]
+                        opp_ids, _drop = resolve_preset_field(preset, bot_ids, excluded_ids)
                         if not opp_ids:
-                            skipped.append(pname)
+                            skipped_empty.append(pname)
                             continue
-                        opps = [bot_by_id[b] for b in opp_ids]
+                        if len(opp_ids) + 1 > MAX_SEATS:
+                            skipped_big.append(pname)
+                            continue
+                        opps = [bot_by_id[b] for b in opp_ids]  # dups kept
                         sweep_label = (f"{sweep_label_prefix} · {pname}"
                                        if sweep_label_prefix else f"sweep:{pname}")
                         if mode == "eval":
@@ -799,9 +988,12 @@ with tab_run:
                         st.session_state.queue.append(j)
                         added += 1
                     msg = f"Queued {added} job(s) from sweep."
-                    if skipped:
-                        msg += (f" Skipped (empty after excluding heroes): "
-                                f"{', '.join(skipped)}.")
+                    if skipped_empty:
+                        msg += (" Skipped (empty after excluding heroes): "
+                                + ", ".join(skipped_empty) + ".")
+                    if skipped_big:
+                        msg += (f" Skipped (> {MAX_SEATS} seats): "
+                                + ", ".join(skipped_big) + ".")
                     st.success(msg)
 
     # ----- Queue table -----
@@ -823,6 +1015,7 @@ with tab_run:
                 "status": j["status"],
                 "label": j["label"],
                 "hero(es)": hero_repr,
+                "seats": len(j["opponents"]) + 1,
                 ("opponents" if j["mode"] == "eval" else "field"):
                     ", ".join(o["id"] for o in j["opponents"]),
                 "preset": j["preset_name"] or "",
@@ -852,8 +1045,6 @@ with tab_run:
             pending = [j for j in q if j["status"] == "pending"]
             queue_start = time.time()
             total_matches = sum(j["params"]["matches"] for j in pending)
-            # Mutable holder so the per-job callback can update the queue-wide
-            # match counter (closures capture by reference, not by value).
             qstate = {"completed_prior": 0, "current_done": 0}
 
             overall = st.progress(
@@ -875,7 +1066,6 @@ with tab_run:
                             _total_matches=total_matches,
                             _job_idx=k, _n_jobs=len(pending),
                             _overall=overall):
-                        # --- per-job ----------------------------------------
                         now = time.time()
                         job_elapsed = now - _start
                         job_rate = done / max(job_elapsed, 1e-9)
@@ -887,7 +1077,6 @@ with tab_run:
                                   f"ETA {_fmt_dur(job_eta)}"),
                         )
                         _info.caption(f"{job_rate:.2f} matches/s")
-                        # --- queue-wide -------------------------------------
                         _qstate["current_done"] = done
                         global_done = _qstate["completed_prior"] + done
                         q_elapsed = now - _qstart
@@ -902,15 +1091,8 @@ with tab_run:
                                   f"ETA {_fmt_dur(q_eta)}"),
                         )
 
-                    run_job(
-                        job,
-                        st.session_state.results_dir,
-                        progress_callback=_cb,
-                    )
+                    run_job(job, st.session_state.results_dir, progress_callback=_cb)
 
-                    # Lock in whatever the callback last reported for this job
-                    # (matches the actual amount of work done — important when
-                    # a job errors partway through so the queue ETA stays honest).
                     qstate["completed_prior"] += qstate["current_done"]
 
                     if job["status"] == "done":
@@ -941,101 +1123,51 @@ with tab_run:
 # ---------------------------------------------------------------------------
 
 def _normalize_legacy_result(d: dict) -> dict:
-    """Translate v1 (CLI-flat) JSON files into the v2 dashboard shape so the
-    inspector can render them. No-op on anything already v2-shaped (or any
-    shape we don't recognise — pass-through, the inspector will degrade
-    gracefully via .get() everywhere).
-
-    Recognised legacy shapes:
-
-    AB v1 (from `backtest.py ab --json`):
-        {"a": "A:foo", "b": "B:bar", "elapsed_s": ...,
-         "A": {...}, "B": {...}, "A_minus_B": {...}, "t_stat": ...}
-
-    Eval v1 (from `backtest.py eval --json`):
-        {"hero": "myhero", "elapsed_s": ...,
-         "stats": {bot_id: summarize(...), ...}}
-    """
-    # v2 files have a "metadata" block. Anything with metadata is already new.
+    """Translate v1 (CLI-flat) JSON files into the v2 dashboard shape. No-op on
+    anything already v2-shaped or unrecognised (pass-through; the inspector
+    degrades gracefully via .get())."""
     if d.get("schema_version") == 2 or "metadata" in d:
         return d
 
-    # ---- AB v1 -----------------------------------------------------------
     if {"A", "B", "A_minus_B"} <= set(d.keys()):
         a = d.get("a", "A")
         b = d.get("b", "B")
         a_stats = d.get("A") or {}
         return {
-            **d,
-            "schema_version": 2,
-            "mode": "ab",
-            "metadata": {
-                "job_id": f"legacy_{a}_{b}",
-                "label": f"legacy: {a} vs {b}",
-                "mode": "ab",
-                "created_at": None,
-                "started_at": None,
-                "completed_at": None,
-            },
-            "hero_a": {"id": a, "path": ""},
-            "hero_b": {"id": b, "path": ""},
-            "opponents": [],              # CLI JSON didn't record the field
-            "preset_name": None,
-            "params": {
-                "matches": a_stats.get("matches"),
-                "hands": 400,             # default that the CLI used
-                "seed_base": None, "budget": None, "fold_on_timeout": None,
-            },
+            **d, "schema_version": 2, "mode": "ab",
+            "metadata": {"job_id": f"legacy_{a}_{b}", "label": f"legacy: {a} vs {b}",
+                         "mode": "ab", "created_at": None, "started_at": None,
+                         "completed_at": None},
+            "hero_a": {"id": a, "path": ""}, "hero_b": {"id": b, "path": ""},
+            "opponents": [], "preset_name": None,
+            "params": {"matches": a_stats.get("matches"), "hands": 400,
+                       "seed_base": None, "budget": None, "fold_on_timeout": None},
             "stats": {"A": d["A"], "B": d["B"], "A_minus_B": d["A_minus_B"]},
-            "t_stat": d.get("t_stat"),
-            "elapsed_s": d.get("elapsed_s"),
-            "per_match_deltas": None,     # not in v1
-            "errors_per_bot": None,
-            "timing_per_bot": None,
-            "error": None,
-            "_legacy": "ab_v1",
+            "t_stat": d.get("t_stat"), "elapsed_s": d.get("elapsed_s"),
+            "per_match_deltas": None, "errors_per_bot": None,
+            "timing_per_bot": None, "error": None, "_legacy": "ab_v1",
         }
 
-    # ---- Eval v1 ---------------------------------------------------------
-    # Eval v1 had hero as a *string*; v2 has hero as {id, path} dict. Use that
-    # shape difference as the gate, so we don't accidentally re-translate v2.
     if isinstance(d.get("hero"), str) and isinstance(d.get("stats"), dict):
         hero_str = d["hero"]
         stats = d["stats"]
         hero_stats = stats.get(hero_str) or {}
         return {
-            **d,
-            "schema_version": 2,
-            "mode": "eval",
-            "metadata": {
-                "job_id": f"legacy_{hero_str}",
-                "label": f"legacy: {hero_str}",
-                "mode": "eval",
-                "created_at": None,
-                "started_at": None,
-                "completed_at": None,
-            },
+            **d, "schema_version": 2, "mode": "eval",
+            "metadata": {"job_id": f"legacy_{hero_str}", "label": f"legacy: {hero_str}",
+                         "mode": "eval", "created_at": None, "started_at": None,
+                         "completed_at": None},
             "hero": {"id": hero_str, "path": ""},
-            "opponents": [
-                {"id": bid, "path": ""} for bid in stats.keys() if bid != hero_str
-            ],
+            "opponents": [{"id": bid, "path": ""} for bid in stats.keys() if bid != hero_str],
             "preset_name": None,
-            "params": {
-                "matches": hero_stats.get("matches"),
-                "hands": 400,
-                "seed_base": None, "budget": None, "fold_on_timeout": None,
-                "reload": None, "rotate_seats": None,
-            },
-            "stats": stats,
-            "elapsed_s": d.get("elapsed_s"),
-            "per_match_deltas": None,
-            "errors_per_bot": None,
-            "timing_per_bot": None,
-            "error": None,
-            "_legacy": "eval_v1",
+            "params": {"matches": hero_stats.get("matches"), "hands": 400,
+                       "seed_base": None, "budget": None, "fold_on_timeout": None,
+                       "reload": None, "rotate_seats": None},
+            "stats": stats, "elapsed_s": d.get("elapsed_s"),
+            "per_match_deltas": None, "errors_per_bot": None,
+            "timing_per_bot": None, "error": None, "_legacy": "eval_v1",
         }
 
-    # Unknown shape: pass through. The inspector's .get() calls degrade.
     return d
 
 
@@ -1049,7 +1181,6 @@ with tab_results:
     else:
         st.caption(f"{len(files)} result file(s) in `{results_dir}`")
 
-        # ----- Index table -----
         index_rows = []
         for f in files:
             try:
@@ -1064,7 +1195,6 @@ with tab_results:
                     b = (d.get("hero_b") or {}).get("id") or "?"
                     hero_repr = f"A:{a} vs B:{b}"
                     opps_repr = ", ".join(o.get("id", "?") for o in (d.get("opponents") or []))
-                    # Surface the t-stat in the index — it's the headline number for ab.
                     t = d.get("t_stat")
                     headline = (f"t={t:+.2f}" if isinstance(t, (int, float)) else None)
                 index_rows.append({
@@ -1084,22 +1214,17 @@ with tab_results:
                 })
             except Exception as exc:
                 index_rows.append({
-                    "file": f.name,
-                    "mode": "?",
-                    "completed_at": None,
-                    "label": f"(unreadable: {exc})",
-                    "hero(es)": None, "opponents": None, "preset": "",
-                    "matches": None, "hands": None,
-                    "headline": "", "elapsed_s": None, "error": True,
+                    "file": f.name, "mode": "?", "completed_at": None,
+                    "label": f"(unreadable: {exc})", "hero(es)": None,
+                    "opponents": None, "preset": "", "matches": None,
+                    "hands": None, "headline": "", "elapsed_s": None, "error": True,
                 })
         st.dataframe(index_rows, use_container_width=True, hide_index=True)
 
         st.markdown("---")
         st.markdown("**Inspect one result**")
         selected_name = st.selectbox(
-            "Result file",
-            options=[f.name for f in files],
-            key="result_select",
+            "Result file", options=[f.name for f in files], key="result_select",
         )
         selected = next((f for f in files if f.name == selected_name), None)
         if selected:
@@ -1140,7 +1265,6 @@ with tab_results:
                     st.code(data["error"].get("traceback") or "", language="text")
 
                 stats = data.get("stats")
-                # --- Stats tables --------------------------------------------
                 if stats and mode == "eval":
                     hero_id = (data.get("hero") or {}).get("id")
                     rows = []
@@ -1180,7 +1304,6 @@ with tab_results:
                     st.markdown("**A vs B (paired)**")
                     st.dataframe(ab_rows, use_container_width=True, hide_index=True)
 
-                    # Significance verdict
                     t_stat = data.get("t_stat")
                     diff = stats.get("A_minus_B") or {}
                     ci_low, ci_high = diff.get("ci_low"), diff.get("ci_high")
@@ -1189,30 +1312,27 @@ with tab_results:
                                     if t_stat is not None and abs(t_stat) >= 1.96
                                     else "not significant at ~95%")
                     if ci_low is not None and ci_low > 0:
-                        verdict = f"**A beats B** — 95% CI on (A − B) strictly above 0."
+                        verdict = "**A beats B** — 95% CI on (A − B) strictly above 0."
                     elif ci_high is not None and ci_high < 0:
-                        verdict = f"**B beats A** — 95% CI on (A − B) strictly below 0."
+                        verdict = "**B beats A** — 95% CI on (A − B) strictly below 0."
                     else:
                         verdict = ("**Indistinguishable** — 95% CI on (A − B) "
                                    "straddles 0. Run more matches.")
                     st.markdown(
-                        f"paired t-stat: `{t_stat:+.2f}` ({significance})  ·  "
-                        f"mean (A−B)/match: `{mean_d:+.0f}`  ·  {verdict}"
+                        f"paired t-stat: `{(t_stat or 0.0):+.2f}` ({significance})  ·  "
+                        f"mean (A−B)/match: `{(mean_d or 0.0):+.0f}`  ·  {verdict}"
                     )
 
                 # --- Timing / crashes -----------------------------------------
                 if stats:
                     errs = data.get("errors_per_bot") or {}
                     timing = data.get("timing_per_bot") or {}
-                    has_bad_timing = any(t.get("slow", 0) for t in timing.values())
+                    has_bad_timing = any((t or {}).get("slow", 0) for t in timing.values())
                     if any(errs.values()) or has_bad_timing:
                         st.markdown("**Timing / crashes**")
-                        # For eval, stats.keys() are bot ids. For ab, they're
-                        # {"A","B","A_minus_B"} — not real bot ids. Pull bot
-                        # ids from errors_per_bot / timing_per_bot directly.
-                        bot_ids = sorted(set(list(errs.keys()) + list(timing.keys())))
+                        ids = sorted(set(list(errs.keys()) + list(timing.keys())))
                         timing_rows = []
-                        for bid in bot_ids:
+                        for bid in ids:
                             timing_rows.append({
                                 "bot": bid,
                                 "crashes (auto-folded)": errs.get(bid, 0),

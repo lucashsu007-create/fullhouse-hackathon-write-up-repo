@@ -375,6 +375,19 @@ def _run_ab(a_path, b_path, field_paths, matches, hands, seed_base,
 # Bot library
 # ---------------------------------------------------------------------------
 
+# Characters disallowed in a bot id / folder name.
+_INVALID_NAME_CHARS = r"\/:*?\"<>| "
+
+
+def _name_problem(name: str) -> str | None:
+    """Reason the name is unusable, or None if it's fine."""
+    if not name:
+        return "empty name"
+    if any(c in name for c in _INVALID_NAME_CHARS):
+        return "spaces or path separators not allowed"
+    return None
+
+
 def list_bots(bots_dir: str) -> list[dict]:
     """Return [{id, path}] sorted by id. Looks for:
        - bots_dir/<name>/bot.py  (preferred layout)
@@ -670,28 +683,53 @@ with tab_setup:
                     st.rerun()
 
         st.markdown("---")
-        st.markdown("**Upload a bot**")
+        st.markdown("**Upload bots**")
+        st.caption("Drag and drop one or more `.py` files (or click to browse). "
+                   "Each bot is named after its filename; the override below "
+                   "applies only when you upload a single file.")
+
+        # Surface the outcome of the previous save across the list-refresh rerun.
+        _msg = st.session_state.pop("_upload_msg", None)
+        if _msg:
+            if _msg.get("saved"):
+                st.success("Saved: " + ", ".join(f"`{n}`" for n in _msg["saved"]))
+            if _msg.get("skipped"):
+                st.warning("Skipped — " + "; ".join(_msg["skipped"]))
+
+        up_files = st.file_uploader(
+            "bot.py file(s)",
+            type="py",
+            key="upload_files",
+            accept_multiple_files=True,
+        )
+        single = len(up_files) == 1
         up_name = st.text_input(
-            "Bot name (used as the id and folder name)",
+            "Name override (single file only)",
             key="upload_name",
             placeholder="e.g. shark, nit, my_hero_v3",
+            disabled=not single,
+            help="Leave blank to use the filename. Ignored when several files "
+                 "are uploaded at once.",
         )
-        up_file = st.file_uploader("bot.py", type="py", key="upload_file")
         if st.button("Save to library", key="save_bot"):
-            name = (up_name or "").strip()
-            if not name:
-                st.error("Give the bot a name.")
-            elif not up_file:
-                st.error("Choose a .py file.")
-            elif any(c in name for c in r"\/:*?\"<>| "):
-                st.error("Bot name can't contain spaces or path separators.")
-            elif (Path(st.session_state.bots_dir) / name).exists():
-                st.error(f"A bot named `{name}` already exists.")
+            if not up_files:
+                st.error("Choose at least one .py file.")
             else:
-                target = save_uploaded_bot(
-                    st.session_state.bots_dir, name, up_file.read()
-                )
-                st.success(f"Saved → {target}")
+                saved, skipped = [], []
+                override = (up_name or "").strip()
+                for uf in up_files:
+                    name = (override if (single and override)
+                            else Path(uf.name).stem).strip()
+                    problem = _name_problem(name)
+                    if problem:
+                        skipped.append(f"{uf.name} ({problem})")
+                        continue
+                    if (Path(st.session_state.bots_dir) / name).exists():
+                        skipped.append(f"{uf.name} → `{name}` already exists")
+                        continue
+                    save_uploaded_bot(st.session_state.bots_dir, name, uf.read())
+                    saved.append(name)
+                st.session_state["_upload_msg"] = {"saved": saved, "skipped": skipped}
                 st.rerun()
 
     # ----- Presets -----

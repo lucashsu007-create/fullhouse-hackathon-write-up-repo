@@ -1433,13 +1433,14 @@ def _preflop_history(state):
         raises:              count of preflop raises so far
         first_raiser_seat:   seat index of first raiser (or None)
         last_raiser_seat:    seat of most recent raiser
-        last_raiser_was_us:  bool
+        last_raiser_was_us:  bool   (most-recent raiser was us)
+        first_raiser_was_us: bool   (we opened the pot this preflop)
         first_raiser_pos:    position name (UTG..SB) of first raiser
         last_raiser_pos:     position name of most recent raiser
     """
     info = {"raises": 0,
             "first_raiser_seat": None, "last_raiser_seat": None,
-            "last_raiser_was_us": False,
+            "last_raiser_was_us": False, "first_raiser_was_us": False,
             "first_raiser_pos": None, "last_raiser_pos": None}
     me = state.get("seat_to_act")
     log = state.get("action_log") or []
@@ -1453,6 +1454,7 @@ def _preflop_history(state):
             if info["first_raiser_seat"] is None:
                 info["first_raiser_seat"] = seat
                 info["first_raiser_pos"] = positions.get(seat)
+                info["first_raiser_was_us"] = (seat == me)
             info["last_raiser_seat"] = seat
             info["last_raiser_pos"] = positions.get(seat)
             info["last_raiser_was_us"] = (seat == me)
@@ -1601,7 +1603,7 @@ def _preflop_v6(state):
         return _open_branch(state, hand, pos, rng)
 
     # There's been at least one raise.
-    if history["last_raiser_was_us"]:
+    if history["first_raiser_was_us"]:
         # We opened and got 3-bet (or 5-bet, etc.). Use 4-bet defense.
         return _four_bet_branch(state, hand, rng)
 

@@ -1,0 +1,17 @@
+{
+  "name": "extended_10",
+  "created_at": "2026-05-27T23:16:21Z",
+  "bot_ids": [
+    "simple_tag",
+    "balanced_tag",
+    "trap_tag",
+    "nit_folder",
+    "calling_station",
+    "mc_pot_odds",
+    "perma_jam",
+    "competent_tag",
+    "polar_3bettor",
+    "multi_barrel"
+  ],
+  "_bootstrap": true
+}

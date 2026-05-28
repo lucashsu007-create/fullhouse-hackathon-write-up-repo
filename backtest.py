@@ -114,6 +114,16 @@ except Exception:  # pragma: no cover
 
 _load_seq = 0
 
+# Identity-probe dedup: tracks (path, BOT_NAME) pairs already logged in this
+# process so the probe in load_decide prints one stderr line per unique pair
+# instead of once per match (which would be thousands of lines per job in
+# parallel mode). The diagnostic value is in the SET of pairs seen, not in
+# the count — a healthy run shows one line per deployed bot with all
+# BOT_NAMEs distinct from each other; an unhealthy run shows the same
+# BOT_NAME under multiple paths (or vice versa), surfacing a bot-deployment
+# bug at load time rather than after the run finishes.
+_LOAD_PROBE_SEEN: set = set()
+
 
 def load_decide(path):
     """Load bot.py at `path` and return its decide callable. Fresh module each
@@ -127,6 +137,16 @@ def load_decide(path):
     spec.loader.exec_module(mod)
     if not hasattr(mod, "decide") or not callable(mod.decide):
         raise AttributeError(f"{path} has no callable decide()")
+    # Identity probe — see _LOAD_PROBE_SEEN. Cheap permanent insurance against
+    # the deployment-level failure mode where multiple "variant" paths point
+    # to the same file on disk: if that ever happens again, this surfaces it
+    # the first time those paths get loaded rather than 30 minutes into a run.
+    bot_name = getattr(mod, "BOT_NAME", "<no BOT_NAME>")
+    probe_key = (path, bot_name)
+    if probe_key not in _LOAD_PROBE_SEEN:
+        _LOAD_PROBE_SEEN.add(probe_key)
+        print(f"[load_decide] BOT_NAME={bot_name!r}  path={path}",
+              file=sys.stderr, flush=True)
     return mod.decide
 
 

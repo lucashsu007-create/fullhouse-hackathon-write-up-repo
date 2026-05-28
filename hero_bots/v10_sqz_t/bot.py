@@ -1,23 +1,11 @@
 # ============================================================
-# VARIANT: v7.2-narrowed (built on v7_m2)
-# CHANGE 1 (inherited from v7_m2): postflop marginal cutoff 0.38 -> 0.42
-# CHANGE 2 (new in v7.2): street-aware narrowing of villain's range
-#   When villain has called bet(s) postflop, narrow their combo pool to
-#   hands that would actually still be calling on this board:
-#     - drop "air" combos on every postflop call,
-#     - drop dead draws (fd/oesd that can't improve) on the river call.
-#   Applies to WIDE and OPEN buckets; THREEBET / NUTTED / UNKNOWN unchanged.
-# HYPOTHESIS: a passive caller's range tightens every street; v7's static
-#   bucket overestimates how loose they are by the river, inflating hero's
-#   equity vs callers. Same kind of "improve the input to an unchanged policy"
-#   move as v6 -> v7.
-# DIFF FROM v7_m2:
-#   1. _villain_action_summary tracks postflop_calls.
-#   2. _range_for_villain returns {'bucket': str, 'postflop_calls': int}.
-#   3. NEW _passes_narrow_filter and _narrow_range_combos helpers.
-#   4. _equity_vs_one_range / _equity_vs_multi_range take range-spec dicts
-#      and apply narrowing to WIDE/OPEN pools when call count > 0.
-#   5. equity_vs_range passes dicts through.
+# VARIANT: v10-sqz-t (built on v7_m2)
+# SQUEEZER-DEFENSE LEAK FIX: only _VS_3BET is changed.
+# CHANGES: Small fix: add 77, A8s/A9s, KTs, KJo, ATo; bump 88/99.
+# Calls are how often this hand calls a 3-bet (was fold-100% before for added hands).
+# 4-bets are how often this hand 4-bet-bluffs a 3-bet.
+# All other v7_m2 logic (postflop 0.42 marginal cutoff, range-aware equity,
+# chart-based preflop opens, etc.) is byte-identical to the v7_m2 baseline.
 # ============================================================
 """
 ================================================================================
@@ -82,7 +70,7 @@ except Exception:                              # pragma: no cover
     eval7 = None
     _HAVE_EVAL7 = False
 
-BOT_NAME = "v7.2-narrowed"
+BOT_NAME = "v10-sqz-t"
 BOT_AVATAR = "robot_1"
 
 _RANKS = "23456789TJQKA"
@@ -565,17 +553,11 @@ def _villain_is_passive(stats):
 def _villain_action_summary(state, villain_seat):
     """Walk reconstructed history for this hand and report what villain did:
     {acted: bool, voluntary_pre: bool, raised_pre: bool, threebet_pre: bool,
-     four_bet_pre: bool, raised_postflop: bool, posted_blind_only: bool,
-     postflop_calls: int}
-    Defensive — any malformed log returns sensible defaults.
-
-    postflop_calls counts 'call' actions on streets 1/2/3 where owed > 0
-    (i.e. villain called a postflop bet rather than checking through). Used
-    by the street-narrowing logic in _narrow_range_combos."""
+     four_bet_pre: bool, raised_postflop: bool, posted_blind_only: bool}
+    Defensive — any malformed log returns sensible defaults."""
     info = {"acted": False, "voluntary_pre": False, "raised_pre": False,
             "threebet_pre": False, "four_bet_pre": False,
-            "raised_postflop": False, "posted_blind_only": True,
-            "postflop_calls": 0}
+            "raised_postflop": False, "posted_blind_only": True}
     try:
         recon = _reconstruct_hand(state.get("action_log") or [])
     except Exception:
@@ -603,20 +585,12 @@ def _villain_action_summary(state, villain_seat):
         else:
             if act in ("raise", "all_in"):
                 info["raised_postflop"] = True
-            elif act == "call" and rec.get("owed", 0) > 0:
-                info["postflop_calls"] += 1
     return info
 
 
 def _range_for_villain(state, villain_seat, villain_bot_id):
-    """Decide which range bucket fits this villain's action history this hand,
-    along with how many postflop bets they have called (used by the street-
-    narrowing filter).
-
-    Returns a dict: {'bucket': str, 'postflop_calls': int}
-        bucket in {WIDE, OPEN, THREEBET, NUTTED, UNKNOWN}
-        postflop_calls is 0 when bucket in {THREEBET, NUTTED, UNKNOWN} — those
-        ranges are either already tight (no need to narrow) or fully random.
+    """Decide which range bucket fits this villain's action history this hand.
+    Returns one of WIDE / OPEN / THREEBET / NUTTED / UNKNOWN.
 
     Priority order:
       1. Passive-rocket override: confirmed passive villain who has raised
@@ -629,35 +603,33 @@ def _range_for_villain(state, villain_seat, villain_bot_id):
     """
     info = _villain_action_summary(state, villain_seat)
     stats = PLAYER_STATS.get(villain_bot_id)
-    pc = info["postflop_calls"]
 
     # (1) Passive-rocket override. Only fires when the villain actually
     # showed aggression this hand AND their lifetime stats look passive.
     showed_aggression = (info["raised_pre"] or info["threebet_pre"]
                          or info["four_bet_pre"] or info["raised_postflop"])
     if showed_aggression and _villain_is_passive(stats):
-        return {"bucket": "NUTTED", "postflop_calls": 0}
+        return "NUTTED"
 
     # (2) (3) (4) preflop action ladder.
     if info["four_bet_pre"]:
-        return {"bucket": "NUTTED", "postflop_calls": 0}
+        return "NUTTED"
     if info["threebet_pre"]:
-        return {"bucket": "THREEBET", "postflop_calls": 0}
+        return "THREEBET"
     if info["raised_pre"]:
-        return {"bucket": "OPEN", "postflop_calls": pc}
+        return "OPEN"
 
     # If they only called preflop and have now raised postflop, that's
     # a strong signal too — treat as THREEBET-ish (made-hand range).
     if info["raised_postflop"]:
-        bucket = "THREEBET" if not _villain_is_passive(stats) else "NUTTED"
-        return {"bucket": bucket, "postflop_calls": 0}
+        return "THREEBET" if not _villain_is_passive(stats) else "NUTTED"
 
-    # (5) limp/call only -> wide weak range. Narrow per postflop call.
+    # (5) limp/call only -> wide weak range.
     if info["voluntary_pre"]:
-        return {"bucket": "WIDE", "postflop_calls": pc}
+        return "WIDE"
 
     # (6) blinds only, hasn't acted yet -> fall back to random sampling.
-    return {"bucket": "UNKNOWN", "postflop_calls": 0}
+    return "UNKNOWN"
 
 
 def _live_villains(state):
@@ -692,61 +664,7 @@ def _filter_range_against_deck(hand_range, dead_cards):
     return out
 
 
-def _passes_narrow_filter(bucket, fd, oesd, n_postflop_calls):
-    """Decide whether a single combo (with classified strength on this board)
-    is still in villain's range after they have called n_postflop_calls bets.
-
-    Rule:
-      - 'strong' / 'medium' (made hands) always continue.
-      - 'air' is dropped on every postflop call.
-      - 'weak' (weak pair OR live draw) continues on flop/turn calls;
-        on river or later calls, draws are dead (no more cards) so we keep
-        only weak-pair bluff-catchers (no fd/oesd).
-    """
-    if n_postflop_calls <= 0:
-        return True
-    if bucket in ("strong", "medium"):
-        return True
-    if bucket == "air":
-        return False
-    # bucket == "weak"
-    if n_postflop_calls <= 2:        # flop or turn call: draws still live
-        return True
-    has_draw = bool(fd or oesd)
-    return not has_draw              # river-and-beyond call: only bluff-catchers
-
-
-def _narrow_range_combos(combos, board_c, n_postflop_calls):
-    """Filter villain's combo pool to hands that would still be calling on
-    this board after n_postflop_calls postflop bets. Returns a list of combos.
-
-    Safety net: if the filter is so aggressive that fewer than 5 combos
-    remain (e.g. dry board + tight pool already shrunk by dead-card removal),
-    return the unfiltered pool so equity_vs_multi_range doesn't end up with
-    a degenerate single-combo opponent.
-    """
-    if not combos or n_postflop_calls <= 0 or not board_c:
-        return combos
-    board_strs = [_CARD_STR.get(c, str(c)) for c in board_c]
-    kept = []
-    for combo in combos:
-        c1, c2 = combo
-        try:
-            hole_strs = [_CARD_STR.get(c1, str(c1)),
-                         _CARD_STR.get(c2, str(c2))]
-            bucket, fd, oesd = _postflop_strength(hole_strs, board_strs)
-        except Exception:
-            # Classifier error — keep the combo rather than silently drop it.
-            kept.append(combo)
-            continue
-        if _passes_narrow_filter(bucket, fd, oesd, n_postflop_calls):
-            kept.append(combo)
-    if len(kept) < 5:
-        return combos
-    return kept
-
-
-def _equity_vs_one_range(hole_c, board_c, opp_range_spec, rng,
+def _equity_vs_one_range(hole_c, board_c, opp_range_str, rng,
                          time_budget=0.30, max_iters=2000):
     """Heads-up: hero vs one range. Deterministic — we drive the MC with our
     spot-seeded RNG so paired A/B variance reduction holds. eval7's native
@@ -754,52 +672,38 @@ def _equity_vs_one_range(hole_c, board_c, opp_range_spec, rng,
     which breaks pairing — so we route the single-villain case through the
     same multi-range MC as multiway (with a 1-element opp list). It's a few
     ms slower than the native call but still well under any time budget.
-
-    opp_range_spec is a {'bucket': str, 'postflop_calls': int} dict (the new
-    v7.2 contract); we just forward it to multi-range.
     """
     if not _HAVE_EVAL7:
         return None
-    if opp_range_spec["bucket"] == "UNKNOWN":
+    if opp_range_str == "UNKNOWN":
         return None
-    return _equity_vs_multi_range(hole_c, board_c, [opp_range_spec], rng,
+    return _equity_vs_multi_range(hole_c, board_c, [opp_range_str], rng,
                                   time_budget=time_budget, max_iters=max_iters)
 
 
-def _equity_vs_multi_range(hole_c, board_c, opp_range_specs, rng,
+def _equity_vs_multi_range(hole_c, board_c, opp_range_strs, rng,
                            time_budget=0.30, max_iters=1500):
     """Multiway: roll our own MC drawing one combo per opponent from each
     range (or all-hands for UNKNOWN), rejecting card conflicts. Slower than
-    eval7's native HU path but accurate for multiway.
-
-    Each opp_range_specs entry is a {'bucket': str, 'postflop_calls': int}
-    dict. When bucket in {WIDE, OPEN} and postflop_calls > 0 we narrow the
-    combo pool to combos that would still be calling on this board (see
-    _narrow_range_combos). THREEBET / NUTTED / UNKNOWN are unchanged."""
+    eval7's native HU path but accurate for multiway."""
     if not _HAVE_EVAL7 or not _FULL_DECK:
         return None
 
-    # Build per-opponent combo lists, filtered against hero+board cards
-    # AND (for WIDE/OPEN callers) narrowed by the count of postflop calls.
+    # Build per-opponent combo lists, filtered against hero+board cards.
     dead_base = set(hole_c) | set(board_c)
     opp_pools = []
-    for spec in opp_range_specs:
-        bucket = spec["bucket"]
-        n_calls = spec.get("postflop_calls", 0)
-        if bucket == "UNKNOWN":
+    for rs in opp_range_strs:
+        if rs == "UNKNOWN":
             opp_pools.append(None)        # signal: any 2 cards
-            continue
-        hr = _HANDRANGES.get(bucket)
-        pool = _filter_range_against_deck(hr, dead_base)
-        if not pool:
-            # Tight range eliminated by hero+board -> fall back to random
-            # for this opp (rather than crashing or returning None).
-            opp_pools.append(None)
-            continue
-        # Street-aware narrowing for WIDE/OPEN callers.
-        if n_calls > 0 and bucket in ("WIDE", "OPEN"):
-            pool = _narrow_range_combos(pool, board_c, n_calls)
-        opp_pools.append(pool)
+        else:
+            hr = _HANDRANGES.get(rs)
+            pool = _filter_range_against_deck(hr, dead_base)
+            if not pool:
+                # Tight range eliminated by hero+board -> fall back to random
+                # for this opp (rather than crashing or returning None).
+                opp_pools.append(None)
+            else:
+                opp_pools.append(pool)
 
     need_board = 5 - len(board_c)
     if need_board < 0:
@@ -896,26 +800,25 @@ def equity_vs_range(hole, board, state, time_budget=None, rng=None):
     villains = _live_villains(state)
     if not villains:
         return None
-    range_specs = [_range_for_villain(state, seat, bid)
-                   for seat, bid in villains]
+    range_strs = [_range_for_villain(state, seat, bid)
+                  for seat, bid in villains]
 
     # If every opponent is UNKNOWN, we have nothing to do — let the caller
     # use the cheaper equity_vs_random.
-    if all(rs["bucket"] == "UNKNOWN" for rs in range_specs):
+    if all(r == "UNKNOWN" for r in range_strs):
         return None
 
     if rng is None:
         rng = random.Random()
 
-    # Heads-up: use the same MC loop with a single-element opp list. (See
-    # _equity_vs_one_range for why we don't take eval7's native fast path.)
-    if len(range_specs) == 1 and range_specs[0]["bucket"] != "UNKNOWN":
-        eq = _equity_vs_one_range(hole_c, board_c, range_specs[0], rng,
+    # Heads-up: use eval7's native fast path. ~10x faster than our own MC loop.
+    if len(range_strs) == 1 and range_strs[0] != "UNKNOWN":
+        eq = _equity_vs_one_range(hole_c, board_c, range_strs[0], rng,
                                   time_budget=time_budget or 0.30)
         return eq
 
     # Multiway (or HU with UNKNOWN mixed in): our own MC.
-    return _equity_vs_multi_range(hole_c, board_c, range_specs, rng,
+    return _equity_vs_multi_range(hole_c, board_c, range_strs, rng,
                                   time_budget=time_budget or 0.30)
 
 
@@ -1405,14 +1308,21 @@ def _defense_distribution(opener_pos, our_pos, hand):
 
 
 # 4-bet defense: we opened and now face a 3-bet.
+# v7_m2_sqz_t: small fix — add 77, A8s/A9s, KTs, KJo, ATo; bump 88/99 freqs.
 _VS_3BET = {
+    # Pairs (88/99 bumped, 77 added)
     "AA": _d(1.0), "KK": _d(0.95, 0.05),
     "QQ": _d(0.50, 0.50), "JJ": _d(0, 0.85), "TT": _d(0, 0.65),
-    "99": _d(0, 0.40), "88": _d(0, 0.25),
+    "99": _d(0, 0.65), "88": _d(0, 0.50), "77": _d(0, 0.45),
+    # Aces (A8s/A9s/ATo added)
     "AKs": _d(0.85, 0.15), "AKo": _d(0.50, 0.50),
     "AQs": _d(0, 0.85), "AQo": _d(0, 0.30),
-    "AJs": _d(0, 0.55), "ATs": _d(0, 0.30),
-    "KQs": _d(0, 0.50), "KJs": _d(0, 0.20),
+    "AJs": _d(0, 0.55), "ATs": _d(0, 0.30), "ATo": _d(0, 0.25),
+    "A9s": _d(0, 0.40), "A8s": _d(0, 0.30),
+    # Kings (KTs/KJo added)
+    "KQs": _d(0, 0.50), "KJs": _d(0, 0.20), "KTs": _d(0, 0.35),
+    "KJo": _d(0, 0.30),
+    # Misc
     "QJs": _d(0, 0.20), "JTs": _d(0, 0.20),
     # Small 4-bet bluffs with blockers
     "A5s": _d(0.15), "A4s": _d(0.10),

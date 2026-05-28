@@ -1,188 +1,196 @@
-## Current Bot Versions and Results
+## \# Poker Bot — Technical Report
 
-### V4.1: Frozen SafeTAG Baseline
+## 
 
-`v4.1` is the frozen control baseline.
+## \*\*Current frozen baseline: V7 (`v7\_range\_equity`).\*\*
 
-It uses:
+## V8 and V9 evaluated and rejected. See \[Why V8/V9 were rejected](#why-v8v9-were-rejected).
 
-- 2-bucket positional preflop logic,
-- pot-sized opens,
-- 4-bucket postflop equity tree,
-- `eval7` Monte Carlo equity versus uniform-random opponent hands,
-- RAM-only opponent statistics collection,
-- implementation and behavior classifier outputs.
+## 
 
-Important: the V3 statistics system and V4 classifier are populated, but they are not used for actions in V4.1.
+## \---
 
-```text
-V4.1 action = SafeTAG(state, equity_vs_random)
-```
+## 
 
-This makes V4.1 the clean baseline for paired A/B testing.
+## \## Version lineage
 
----
+## 
 
-### V6: Preflop Chart Extension
+## | Version | Main change | Scope | Status |
 
-`v6` is a preflop-only extension of V4.1.
+## |---|---|---|---|
 
-The postflop logic, equity engine, and classifier behavior remain byte-identical to V4.1.
+## | V4.1 | SafeTAG baseline; classifier reads collected but unused | Baseline | Superseded |
 
-Main changes:
+## | V6 | Per-position GTO-Wizard preflop charts, opens, 3-bet/4-bet defense, jam ranges | Preflop | Validated upgrade |
 
-- replaced the 2-bucket preflop rule with per-position GTO Wizard charts,
-- added position-specific charts for UTG, HJ, CO, BTN, and SB,
-- added per-seat open sizes from 2.1bb to 3.5bb,
-- added 9-table opener-tier × defender-role 3-bet defense,
-- added dedicated 4-bet table,
-- added position-keyed jam ranges below 20bb effective,
-- added heads-up SB override.
+## | V7 | Range-aware postflop equity (`equity\_vs\_range`) replacing random-hand equity | Postflop equity | \*\*Frozen baseline\*\* |
 
-```text
-V6 = V4.1 + stronger preflop policy
-```
+## | V8.1 | Board-conditioned NUTTED range on coordinated boards | Postflop range | Rejected (no gain) |
 
-#### V6 A/B Results Versus V4.1
+## | V9 / V9a-c | Opponent-conditional exploit modules (anti-perma / anti-station / anti-folder) | Exploits | Rejected (no gain, downside) |
 
-| Field | Result vs V4.1 | t-stat | Interpretation |
-|---|---:|---:|---|
-| Mixed | +16.4 bb/100 | 2.32 | Statistically positive, p ≈ 0.02 |
-| Station-heavy | +28.1 bb/100 | 4.19 | Strong positive |
-| Tight-heavy | Positive | Not significant | Directionally positive |
-| Aggro-heavy | Positive | Not significant | Directionally positive |
+## 
 
-Conclusion:
+## Validated cumulative improvement V4.1 → V7 ≈ +25 bb/100 on mixed fields. V6 was statistically positive vs V4.1 (mixed +16.4 bb/100, t≈2.32; station-heavy +28.1, t≈4.19). V7 was strong positive vs V6 on trap-heavy (+20.3 bb/100, t≈4.18), directionally positive on mixed (+10.7, t≈1.49), with \~15% lower mixed-field variance.
 
-```text
-V6 materially improves the baseline, mainly through stronger preflop discipline and sizing.
-```
+## 
 
----
+## \---
 
-### V7: Range-Aware Postflop Equity Extension
+## 
 
-`v7` is a postflop-equity extension of V6.
+## \## What V7 is
 
-The key change is replacing:
+## 
 
-```text
-equity_vs_random
-```
+## V7 is a tight-aggressive bot with three layers:
 
-with:
+## 
 
-```text
-equity_vs_range
-```
+## \- \*\*Preflop (V6):\*\* per-position RFI charts (UTG/HJ/CO/BTN/SB), per-seat open sizes (2.1–3.5bb), opener-tier × defender-role 3-bet defense, dedicated 4-bet table, sub-20bb jam ranges, heads-up SB override.
 
-Instead of assuming opponents hold uniform-random hands postflop, V7 assigns each opponent a range bucket from their observed action log.
+## \- \*\*Postflop (V7):\*\* Monte Carlo equity via `eval7`, sampling each live opponent from a \*\*range bucket\*\* (`WIDE / OPEN / THREEBET / NUTTED / UNKNOWN`) inferred from their action log, instead of uniform-random hands. A passive-rocket override upgrades a stats-confirmed passive villain to `NUTTED` when they raise. Equity feeds a fixed 4-bucket decision tree; thresholds and sizings are unchanged from V6.
 
-Opponent range buckets:
+## \- \*\*Stats/classifier:\*\* RAM-only opponent stats and implementation/behavior classifiers are populated but \*\*collection-only\*\* — they do not drive actions.
 
-```text
-WIDE
-OPEN
-THREEBET
-NUTTED
-UNKNOWN
-```
+## 
 
-A passive-rocket override upgrades an opponent to `NUTTED` when a `PLAYER_STATS`-confirmed passive villain raises in the current hand.
+## Design property that matters for robustness: \*\*V7 has no opponent-model-dependent branch in the action path.\*\* Range estimation only changes the equity \*number\*; it never swaps the policy. The equity engine degrades gracefully (`equity\_vs\_range` → `equity\_vs\_random` fallback on any failure). V7 makes the same well-calibrated decision regardless of regime.
 
-Multiway equity uses per-iteration combo sampling with deck-conflict rejection. Heads-up spots use the same path to preserve spot-RNG determinism.
+## 
 
-Postflop thresholds are unchanged.
+## \---
 
-```text
-V7 = V6 + range-aware postflop equity
-```
+## 
 
-#### V7 A/B Results Versus V6
+## \## Why V8/V9 were rejected
 
-| Field | Result vs V6 | t-stat | Interpretation |
-|---|---:|---:|---|
-| Trap-heavy | +20.3 bb/100 | 4.18 | Strong positive, p < 0.001 |
-| Mixed | +10.7 bb/100 | 1.49 | Borderline positive |
-| Mixed standard deviation | 15% reduction |  | Lower variance |
+## 
 
-Estimated cumulative improvement:
+## V8 (board-conditioned NUTTED) and V9 (three opponent-conditional exploit modules) are \*\*conditional overlays\*\* on V7: each only changes a decision when a narrow trigger fires, otherwise falling through to V7. This gives them capped upside and open-ended downside — a false-positive trigger replaces a good baseline decision with a regime-specific one.
 
-```text
-V4.1 -> V7 ≈ +25 bb/100 on mixed fields
-```
+## 
 
-Conclusion:
+## Paired A/B (shared spot seeds), 100 matches × 500 hands per field:
 
-```text
-V7 improves exploit resistance against trap-heavy opponents while also reducing mixed-field variance.
-```
+## 
 
----
+## | field | V7 | V8.1 | V9 (all) | V9a perma | V9b station | V9c folder |
 
-## Version Summary
+## |---|---|---|---|---|---|---|
 
-| Version | Main Change | Scope | Status |
-|---|---|---|---|
-| V4.1 | SafeTAG baseline with unused classifier reads | Baseline | Frozen control |
-| V6 | GTO Wizard preflop charts, better opens, 3-bet defense, 4-bets, jam ranges | Preflop | Strong improvement |
-| V7 | Range-aware postflop equity instead of random-hand equity | Postflop equity | Current best candidate |
+## | barrel | \*\*30.49\*\* | 30.49 | 29.76 | 30.49 | 30.65 | 29.60 |
 
----
+## | polar3bet | 16.61 | 16.87 | \*\*17.12\*\* | 16.87 | 16.87 | 17.12 |
 
-## Current Project Status
+## | adaptive | \*\*23.33\*\* | 22.23 | 22.31 | 22.23 | 22.04 | 22.52 |
 
-```text
-V4.1: frozen baseline
-V6: validated preflop upgrade
-V7: validated range-aware postflop upgrade
-Current best version: V7
-```
+## 
 
-Main empirical takeaways:
+## (bb/100). Findings:
 
-```text
-V6 improves preflop EV versus V4.1.
-V7 improves postflop robustness versus V6.
-Trap-heavy performance improves significantly.
-Mixed-field performance improves directionally.
-Mixed-field variance decreases by roughly 15%.
-```
+## 
 
-The current development conclusion is:
+## \- \*\*No extension beats V7 by a meaningful margin in any field.\*\* V7 is best-or-tied in two of three; worst extension gap is V9b −1.3 bb/100 on adaptive.
 
-```text
-V7 is the leading candidate for final validation.
-```
+## \- \*\*Overlays were often pure no-ops.\*\* V8.1 ≡ V7 byte-for-byte on barrel (board filter never fired); V9a ≡ V8.1 everywhere (no perma-jammer was ever detected). The modules target archetypes that were absent from these fields, so they could only misfire.
 
-The next step is to run larger paired A/B validation on V7 before treating it as the final submission bot.
+## \- \*\*When they fired, they bled.\*\* V8.1 −55k chips on adaptive; V9b −65k on adaptive; V9c −44k on barrel. The +aggression module (V9c, anti-folder) was the most consistently negative.
 
----
+## \- All per-field differences are within per-arm noise at n=100, but the paired-difference point estimates are exact and consistently flat-to-negative.
 
-## Updated Strategic Roadmap
+## 
 
-Completed path:
+## Conclusion: improving the \*accuracy of an input\* to a good uniform policy (what V7 did) is robust. \*Conditionally overriding\* that policy on a noisy classifier read (what V8/V9 did) is a bet that needs the read right and the target archetype present; across mixed fields the misfires arrive more reliably than the wins.
 
-```text
-V4.1 frozen SafeTAG baseline
-    -> V6 preflop chart upgrade
-    -> V7 range-aware postflop equity
-```
+## 
 
-Current validation target:
+## \---
 
-```text
-stress-test V7 across mixed, station-heavy, tight-heavy, aggro-heavy, and trap-heavy fields
-```
+## 
 
-Final submission rule:
+## \## Testing methodology
 
-```text
-submit the strongest version only if it improves EV without increasing catastrophic downside risk
-```
+## 
 
-The central rule remains:
+## Backtester is launched via a Streamlit dashboard; output is per-arm aggregate JSON only. Workflow is built around that.
 
-```text
-do not break the baseline
-```
+## 
+
+## \*\*Paired difference is exact, not noisy.\*\* In AB mode all arms run on identical seeded hands, so `total\_delta(candidate) − total\_delta(V7)` is the \*exact\* paired chip difference (hands where bots agree contribute 0). The per-arm `ci95` measures within-arm bounce and is irrelevant for A/B decisions — ignore it for comparisons; use it only for absolute bb/100.
+
+## 
+
+## \*\*Confidence via seed replication.\*\* One `seed\_base` = one exact paired-diff sample. Run K seed\_bases (5 default; \~10 for high-variance fields like perma-jam, where divergence hands are coinflips) and take the mean/CI of the paired diffs. This resolves \~1 bb/100, which the per-arm CI cannot.
+
+## 
+
+## \*\*Batch candidates into one job.\*\* Put V7 + all candidate variants in a single AB job per field per seed\_base. Run count is `seeds × fields`, independent of candidate count. (Reuses the working 6-way AB setup.)
+
+## 
+
+## \*\*Frozen panel.\*\* A fixed set of fields, never changed mid-development:
+
+## \- \*Robustness tier:\* barrel, polar3bet, adaptive, plus archetype fields (folder, station, perma-jam).
+
+## \- \*Leak-finding tier:\* one isolation preset per opponent (find per-opponent leaks the aggregates hide).
+
+## 
+
+## \*\*Promote/reject gate — select on the floor, not the average.\*\* A change promotes only if its paired-diff is positive with CI excluding 0 in the target field, \*\*and\*\* its paired-diff CI lower bound stays above a small negative tolerance in every other field. A +2/−1.5 profile is rejected even with positive mean — that asymmetry is exactly the V8/V9 failure.
+
+## 
+
+## \*\*One change per candidate.\*\* Never bundle two ideas; batched arms isolate for free anyway.
+
+## 
+
+## \---
+
+## 
+
+## \## Known leaks and open items
+
+## 
+
+## \*\*Squeezer leak (priority).\*\* In the barrel field, per-opponent eval decomposition shows the squeezer is the \*only\* opponent net-positive against V7 (+4.18 bb/100; everything else loses, balanced\_lag −12.9). Diagnosis: V7 opens wide per chart, then defends 3-bets with the tight `\_VS\_3BET` table and over-folds, donating opens + dead money to a wide re-raiser. Caveat: at one seed the +4.18 CI brushes zero (per-match 2090 ± \~2520) — confirm with seed replication + `rotate\_seats: true` before acting. Fix direction is \*\*uniform-policy\*\* (defend 3-bets less foldy / more 4-bet bluffs from squeeze-prone seats, and/or tighten those opens), not a conditional anti-squeezer module.
+
+## 
+
+## \*\*Exploit modules have no confirmed use yet.\*\* Archetype eval fields (single seed, rotation off) show V7 already handles the targeted archetypes without help: folder field +26.3 bb/100 (0.72 win); station +19.4 bb/100 with near-zero variance (stdev 4243). The exploit question — do V9a/b/c beat V7 \*in their own best-case field\* — is unresolved and requires AB runs with the candidate arms before any module is reconsidered. Default expectation: delete them unless they clear the floor gate.
+
+## 
+
+## \*\*Scoring objective unresolved (blocks anti-perma).\*\* Perma-jam field is high variance (field stdev \~30k; V7 +40.6 bb/100 at only 0.51 win rate). Calling wider vs jammers raises chip-EV but lowers match win rate. Whether anti-perma is even desirable depends on whether the competition scores cumulative chips or match/tournament placement. Resolve this before testing V9a.
+
+## 
+
+## \*\*Seat rotation.\*\* Eval-mode absolute numbers used `rotate\_seats: false`; per-seat spreads (e.g. identical bots at −8.6 vs −0.2) confirm positional contamination. Harmless in paired AB (cancels), but turn rotation on for any absolute eval comparison.
+
+## 
+
+## \---
+
+## 
+
+## \## Roadmap
+
+## 
+
+## 1\. Confirm the squeezer leak (isolation preset, K seeds, rotation on) and size it.
+
+## 2\. 3-bet-defense recalibration candidates, AB on barrel, gated on: up vs squeezer, flat-or-better vs balanced\_lag / multi\_barrel.
+
+## 3\. Coarse coordinate sweep of postflop equity thresholds (0.72 / 0.55 / 0.38) and sizing fractions — they were tuned against the old random-equity estimate and are likely miscalibrated under V7's more accurate equity.
+
+## 4\. Resolve scoring objective; only then run the exploit modules AB in their archetype fields.
+
+## 5\. Build the JSON-folder aggregation layer (per-(candidate, field) paired-diff mean/CI across seeds + gate verdict).
+
+## 
+
+## \*\*Submission rule:\*\* submit the strongest version only if it improves EV without increasing catastrophic downside. \*\*Do not break the baseline.\*\* Select on the worst-field floor, not the mean.
+
+
+

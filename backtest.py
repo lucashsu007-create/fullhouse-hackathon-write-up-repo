@@ -13,6 +13,17 @@ decide() directly. You lose the OS-level sandbox, but for *your own* bots that's
 fine — and it faithfully reproduces the two behaviours that matter for EV:
 crashes auto-fold, and decide() calls over the time budget auto-fold.
 
+EV-adjustment (this version)
+----------------------------
+Alongside realized `chip_delta`, every match now also returns
+`ev_chip_delta`: the all-in-adjusted chip delta. For any pot where chips locked
+up before the board was complete (an all-in run-out), we remove the variance of
+the remaining community cards by replacing the realized award with the
+*equity-weighted expected* award over the to-come cards (exact enumeration when
+<=2 cards are to come, hand_id-seeded Monte Carlo otherwise). This is a pure
+post-hoc *measurement* read off the completed hand — it never touches the engine
+and cannot change match outcomes. See BLUEPRINT.md Section 3 / Layer 2.
+
 Two modes:
 
   eval   measure ONE hero bot's EV against a field of opponents
@@ -41,7 +52,9 @@ Notes
 """
 
 import argparse
+import hashlib
 import importlib.util
+import itertools
 import json
 import math
 import os
@@ -84,6 +97,15 @@ except Exception as e:  # pragma: no cover
         f"Underlying error: {e}\n"
     )
     raise
+
+# eval7 is the same library the engine uses; importing it here lets us compute
+# equities post-hoc. If it is somehow unavailable, EV-adjustment degrades
+# gracefully to realized (the harness still runs).
+try:
+    import eval7
+    _HAS_EVAL7 = True
+except Exception:  # pragma: no cover
+    _HAS_EVAL7 = False
 
 
 # ---------------------------------------------------------------------------
@@ -132,12 +154,235 @@ def build_decide_map(id_to_path):
 
 
 # ---------------------------------------------------------------------------
+# EV adjustment (post-hoc measurement; reads the completed hand only)
+# ---------------------------------------------------------------------------
+
+# Full 52-card deck as the engine serializes it (ranks upper, suits lower),
+# e.g. "As", "Td", "9h". Card strings in revealed_cards / community_cards use
+# this exact format, so set membership / eval7.Card() round-trip cleanly.
+_RANKS = "23456789TJQKA"
+_SUITS = "shdc"
+_FULL_DECK = [r + s for r in _RANKS for s in _SUITS]
+
+
+def _stable_seed(key):
+    """Deterministic 32-bit seed from any string key. Uses md5 (not Python's
+    salted hash()) so Monte-Carlo equities reproduce across processes/runs.
+    The key folds in the match seed + hand_id, so reruns of the same job
+    reproduce identically while distinct matches sample independently."""
+    h = hashlib.md5(str(key).encode("utf-8")).hexdigest()
+    return int(h, 16) % (2 ** 32)
+
+
+def _pot_equities(contender_holes, pots, lock_board, to_come, mc_key,
+                  mc_samples=4000):
+    """Per-pot win-share equity over the to-come community cards.
+
+    contender_holes : {bot_id: [card_str, card_str]} for non-folded contenders.
+    pots            : list of {"amount", "eligible"} from _reconstruct_side_pots.
+    lock_board      : card_str already on the board at lock-up (len 5 - to_come).
+    to_come         : community cards still to be dealt (0, 1, 2, or 5).
+    mc_key          : string seed key for the Monte-Carlo RNG.
+
+    Returns a list parallel to `pots`; entry i is {bot_id: equity in [0,1]} over
+    that pot's eligible subset, summing to ~1 within the subset. This is the
+    correct quantity for side pots: P(b is best *among that pot's eligible set*),
+    NOT a renormalization of each contender's global win-share (which is biased
+    once stacks diverge and real side pots form). Pots are nested, so a single
+    runout enumeration scores every contender once and feeds all pots. Exact
+    enumeration for to_come <= 2 (also covers the 0-card self-check case),
+    seeded Monte Carlo otherwise.
+    """
+    hole = {b: [eval7.Card(c) for c in cs] for b, cs in contender_holes.items()}
+    board = [eval7.Card(c) for c in lock_board]
+
+    dead = set(lock_board)
+    for cs in contender_holes.values():
+        dead.update(cs)
+    rem = [eval7.Card(c) for c in _FULL_DECK if c not in dead]
+
+    pot_eq = [{b: 0.0 for b in p["eligible"]} for p in pots]
+
+    def tally(extra):
+        fb = board + list(extra)
+        score = {b: eval7.evaluate(hole[b] + fb) for b in contender_holes}
+        for pi, p in enumerate(pots):
+            elig = p["eligible"]
+            best = max(score[b] for b in elig)
+            winners = [b for b in elig if score[b] == best]
+            share = 1.0 / len(winners)
+            for w in winners:
+                pot_eq[pi][w] += share
+
+    if to_come <= 2:
+        # combinations(rem, 0) yields a single empty tuple -> handles to_come==0.
+        n = 0
+        for combo in itertools.combinations(rem, to_come):
+            tally(combo)
+            n += 1
+    else:
+        rng = random.Random(_stable_seed(mc_key))
+        n = mc_samples
+        for _ in range(n):
+            tally(rng.sample(rem, to_come))
+
+    if n == 0:
+        return pot_eq
+    return [{b: e / n for b, e in d.items()} for d in pot_eq]
+
+
+def _reconstruct_side_pots(total_invested, contenders):
+    """Replay the engine's level algorithm over reconstructed total_invested.
+
+    Mirrors PokerEngine._compute_side_pots:
+      levels       = sorted distinct positive total_invested (ALL dealt players)
+      contributors = all dealt players with total_invested >= level  (sets amount)
+      eligible     = contenders (revealed/non-folded) with total_invested >= level
+      amount       = (level - prev_level) * #contributors
+    Rounding residual (dead money from folders) absorbed into the last pot.
+    Returns a list of {"amount": int, "eligible": [bot_id, ...]} or [] if none.
+    """
+    contenders = set(contenders)
+    levels = sorted({ti for ti in total_invested.values() if ti > 0})
+    total_pot = sum(ti for ti in total_invested.values() if ti > 0)
+
+    pots, prev = [], 0
+    for lvl in levels:
+        per = lvl - prev
+        contributors = [b for b, ti in total_invested.items() if ti >= lvl]
+        amount = per * len(contributors)
+        eligible = [b for b in contributors if b in contenders]
+        if amount > 0 and eligible:
+            pots.append({"amount": amount, "eligible": eligible})
+        prev = lvl
+
+    if not pots:
+        return []
+
+    booked = sum(p["amount"] for p in pots)
+    if booked != total_pot:
+        pots[-1]["amount"] += total_pot - booked
+    return pots
+
+
+def compute_hand_ev(state, pre_hand_stacks, mc_samples=4000, debug=False,
+                    match_seed=None):
+    """EV-adjusted per-hand chip delta for the hand described by `state` (a
+    hand_complete dict). `pre_hand_stacks` is {bot_id: stack} before the hand
+    for the participants. Returns {bot_id: ev_delta} over participants.
+
+    Falls back to realized whenever there is no luck to remove (non-showdown,
+    complete board, run-it-out behind a live checker) or when reconstruction is
+    not possible. Pure measurement: reads `state` only, never the engine.
+    """
+    final_stacks = state.get("final_stacks", {})
+    participants = list(final_stacks.keys())
+    realized = {b: final_stacks[b] - pre_hand_stacks[b] for b in participants}
+
+    # No showdown (uncontested / guard) -> nothing to adjust.
+    if not state.get("showdown"):
+        return dict(realized)
+
+    events = state.get("events", [])
+
+    # Lock-up street = the street of the LAST action event, NOT the last
+    # street_start. _advance_street deals the next street and emits its
+    # street_start *before* it checks for a live actor and delegates to
+    # _run_it_out, so the last street_start sits one street too deep on every
+    # all-in run-out (turn all-ins would look complete, flop all-ins would keep
+    # turn variance, preflop jams would keep the flop swing — exactly the
+    # variance we most want gone). The locking action is emitted while
+    # self.street is still the betting street, so key the board off that.
+    action_events = [e for e in events if e.get("type") == "action"]
+    if not action_events:
+        return dict(realized)
+    lock_street = action_events[-1].get("street")
+    ss = [e for e in events
+          if e.get("type") == "street_start" and e.get("street") == lock_street]
+    if not ss:
+        return dict(realized)
+    lock_board = list(ss[-1].get("community_cards", []))
+    to_come = 5 - len(lock_board)
+
+    # Contender set = revealed (non-folded) hole cards; need exactly 2 each.
+    revealed = state.get("revealed_cards", {}) or {}
+    contenders = [b for b in participants
+                  if b in revealed and revealed.get(b) and len(revealed[b]) == 2]
+    if not contenders:
+        return dict(realized)
+
+    # total_invested[bot] = pre-hand stack - stack in the LAST action event's
+    # snapshot (it includes every player, post-action, pre-award).
+    last_stacks = action_events[-1].get("stacks", {})
+    total_invested = {
+        b: pre_hand_stacks[b] - last_stacks.get(b, pre_hand_stacks[b])
+        for b in participants
+    }
+
+    pots = _reconstruct_side_pots(total_invested, contenders)
+    if not pots:
+        return dict(realized)
+
+    if not _HAS_EVAL7:
+        return dict(realized)
+
+    contender_holes = {b: list(revealed[b]) for b in contenders}
+    mc_key = f"{match_seed}:{state.get('hand_id')}"
+    pot_eq = _pot_equities(contender_holes, pots, lock_board, to_come,
+                           mc_key, mc_samples=mc_samples)
+
+    # Each pot is split by its eligible subset's own win-shares (already sum to
+    # ~1 within the subset) — no global renormalization.
+    ev_award = {b: 0.0 for b in contenders}
+    for pi, pot in enumerate(pots):
+        amount = pot["amount"]
+        for b in pot["eligible"]:
+            ev_award[b] += amount * pot_eq[pi][b]
+
+    # to_come == 0: complete board, no luck. ev == realized. Self-check that the
+    # equity split reproduces the engine's awards — validates the side-pot
+    # reconstruction AND the per-pot allocation. (Per-player tolerance absorbs
+    # the engine's remainder-to-first-winner integer split vs. our fair float
+    # split on chopped pots.)
+    if to_come == 0:
+        won = {}
+        for w in state.get("winners", []):
+            won[w["bot_id"]] = won.get(w["bot_id"], 0) + w.get("amount", 0)
+        tol = float(len(contenders)) + 1.0
+        for b in contenders:
+            diff = abs(ev_award.get(b, 0.0) - won.get(b, 0))
+            if diff > tol:
+                msg = (f"[EV self-check] {state.get('hand_id')}: bot {b} "
+                       f"reconstructed award {ev_award.get(b, 0.0):.1f} != "
+                       f"realized award {won.get(b, 0)} (|diff|={diff:.1f})\n")
+                if debug:
+                    raise AssertionError(msg.strip())
+                sys.stderr.write(msg)
+        return dict(realized)
+
+    ev = {}
+    for b in participants:
+        if b in ev_award:
+            ev[b] = ev_award[b] - total_invested[b]
+        else:
+            # Folded players: ev == realized == -total_invested.
+            ev[b] = realized[b]
+    return ev
+
+
+# ---------------------------------------------------------------------------
 # In-process match runner (faithful to sandbox/match.py outcomes)
 # ---------------------------------------------------------------------------
 
-def run_match_inproc(decide_map, n_hands, seed, budget=2.0, fold_on_timeout=True):
+def run_match_inproc(decide_map, n_hands, seed, budget=2.0, fold_on_timeout=True,
+                     compute_ev=True, ev_mc_samples=4000, ev_debug=False):
     """decide_map: ordered dict {bot_id: decide_callable}. Insertion order is the
-    seating order. Returns chip deltas, hands played, per-bot timing and errors."""
+    seating order. Returns chip deltas, EV-adjusted chip deltas, hands played,
+    per-bot timing and errors.
+
+    EV-adjustment is a post-hoc measurement computed from each completed hand;
+    it does not affect play. If `compute_ev` is False, `ev_chip_delta` mirrors
+    `chip_delta`."""
     bot_ids = list(decide_map.keys())
     stacks = {b: STARTING_STACK for b in bot_ids}
     match_log = []
@@ -145,11 +390,17 @@ def run_match_inproc(decide_map, n_hands, seed, budget=2.0, fold_on_timeout=True
     hands_played = 0
     timing = {b: {"max": 0.0, "slow": 0} for b in bot_ids}
     errors = {b: 0 for b in bot_ids}
+    ev_total = {b: 0.0 for b in bot_ids}
+
+    do_ev = compute_ev and _HAS_EVAL7
 
     for hand_num in range(n_hands):
         alive = [b for b in bot_ids if stacks[b] > 0]
         if len(alive) < 2:
             break
+
+        # Pre-hand stacks for the participants (before this hand's awards).
+        pre_hand = {b: stacks[b] for b in alive}
 
         hseed = (seed * 1000003 + hand_num) if seed is not None else None
         eng = PokerEngine(
@@ -202,11 +453,39 @@ def run_match_inproc(decide_map, n_hands, seed, budget=2.0, fold_on_timeout=True
 
         for b, s in state.get("final_stacks", {}).items():
             stacks[b] = s
+
+        # ---- EV accounting (post-hoc, reads the completed hand only) --------
+        if do_ev:
+            if state.get("type") == "hand_complete":
+                try:
+                    hand_ev = compute_hand_ev(state, pre_hand,
+                                              mc_samples=ev_mc_samples,
+                                              debug=ev_debug,
+                                              match_seed=seed)
+                except Exception:
+                    # Never let a measurement bug abort the match; fall back to
+                    # realized for this hand.
+                    hand_ev = {b: stacks[b] - pre_hand[b] for b in alive}
+            else:
+                # 1000-step guard tripped (no hand_complete): realized fallback.
+                hand_ev = {b: stacks.get(b, pre_hand[b]) - pre_hand[b]
+                           for b in alive}
+            for b, v in hand_ev.items():
+                ev_total[b] += v
+
         dealer += 1
         hands_played += 1
 
+    chip_delta = {b: stacks[b] - STARTING_STACK for b in bot_ids}
+    if do_ev:
+        ev_chip_delta = {b: round(ev_total[b], 4) for b in bot_ids}
+    else:
+        # EV disabled / eval7 missing: mirror realized so the key always exists.
+        ev_chip_delta = dict(chip_delta)
+
     return {
-        "chip_delta": {b: stacks[b] - STARTING_STACK for b in bot_ids},
+        "chip_delta": chip_delta,
+        "ev_chip_delta": ev_chip_delta,
         "hands": hands_played,
         "timing": timing,
         "errors": errors,
@@ -264,6 +543,7 @@ def cmd_eval(args):
     id_to_path = dict(zip(ids, paths))
 
     per_bot = {bid: [] for bid in ids}
+    per_bot_ev = {bid: [] for bid in ids}
     t0 = time.time()
     cached = None if args.reload else build_decide_map(id_to_path)
 
@@ -283,35 +563,47 @@ def cmd_eval(args):
 
         res = run_match_inproc(dm, args.hands, seed,
                                budget=args.budget,
-                               fold_on_timeout=not args.no_fold_on_timeout)
+                               fold_on_timeout=not args.no_fold_on_timeout,
+                               compute_ev=not args.no_ev,
+                               ev_mc_samples=args.ev_mc,
+                               ev_debug=args.ev_debug)
         for bid, d in res["chip_delta"].items():
             per_bot[bid].append(d)
+        for bid, d in res.get("ev_chip_delta", {}).items():
+            per_bot_ev[bid].append(d)
 
         if args.verbose and (i + 1) % max(1, args.matches // 10) == 0:
             sys.stderr.write(f"  ...{i+1}/{args.matches} matches\n")
 
     elapsed = time.time() - t0
     stats = {bid: summarize(per_bot[bid], args.hands) for bid in ids}
+    ev_stats = {bid: summarize(per_bot_ev[bid], args.hands) for bid in ids}
 
     if args.json:
         print(json.dumps({"hero": hero_id, "elapsed_s": round(elapsed, 2),
-                          "stats": stats}, indent=2))
+                          "stats": stats, "ev_stats": ev_stats}, indent=2))
         return
 
     print(f"\nEVAL — {args.matches} matches x {args.hands} hands "
           f"({len(ids)}-handed) in {elapsed:.1f}s\n")
-    hdr = f"{'bot':<22}{'mean Δ/match':>14}{'95% CI':>20}{'bb/100':>10}{'win%':>8}"
+    hdr = (f"{'bot':<22}{'mean Δ/match':>14}{'95% CI':>20}"
+           f"{'bb/100':>10}{'ev bb/100':>11}{'win%':>8}")
     print(hdr)
     print("-" * len(hdr))
     for bid in sorted(ids, key=lambda b: -stats[b]["mean_delta"]):
         s = stats[bid]
+        se = ev_stats[bid]
         ci = f"[{s['ci_low']:+,.0f}, {s['ci_high']:+,.0f}]"
         star = "  <-- hero" if bid == hero_id else ""
         print(f"{bid:<22}{s['mean_delta']:>+14,.0f}{ci:>20}"
-              f"{s['bb_per_100']:>+10.2f}{s['win_rate']*100:>7.0f}%{star}")
+              f"{s['bb_per_100']:>+10.2f}{se['bb_per_100']:>+11.2f}"
+              f"{s['win_rate']*100:>7.0f}%{star}")
 
     s = stats[hero_id]
+    se = ev_stats[hero_id]
     print(f"\nHero ({hero_id}): {verdict(s['ci_low'], s['ci_high'])}")
+    print(f"  realized mean Δ {s['mean_delta']:+,.0f}  (sd {s['stdev']:,.0f})   "
+          f"EV-adj mean Δ {se['mean_delta']:+,.0f}  (sd {se['stdev']:,.0f})")
     _print_timing_warnings(per_bot.keys(), args, id_to_path)
 
 
@@ -337,6 +629,7 @@ def cmd_ab(args):
 
     n_seats = len(field_ids) + 1
     a_deltas, b_deltas, paired_diff = [], [], []
+    a_ev_deltas, b_ev_deltas, paired_ev_diff = [], [], []
     t0 = time.time()
 
     for i in range(args.matches):
@@ -353,15 +646,23 @@ def cmd_ab(args):
             dm = build_decide_map({b: paths[b] for b in order})
             return run_match_inproc(dm, args.hands, seed,
                                     budget=args.budget,
-                                    fold_on_timeout=not args.no_fold_on_timeout)
+                                    fold_on_timeout=not args.no_fold_on_timeout,
+                                    compute_ev=not args.no_ev,
+                                    ev_mc_samples=args.ev_mc,
+                                    ev_debug=args.ev_debug)
 
         ra = seated(a_id, args.a)
         rb = seated(b_id, args.b)
         da = ra["chip_delta"][a_id]
         db = rb["chip_delta"][b_id]
+        da_e = ra.get("ev_chip_delta", {}).get(a_id, da)
+        db_e = rb.get("ev_chip_delta", {}).get(b_id, db)
         a_deltas.append(da)
         b_deltas.append(db)
         paired_diff.append(da - db)
+        a_ev_deltas.append(da_e)
+        b_ev_deltas.append(db_e)
+        paired_ev_diff.append(da_e - db_e)
 
         if args.verbose and (i + 1) % max(1, args.matches // 10) == 0:
             sys.stderr.write(f"  ...{i+1}/{args.matches} paired matches\n")
@@ -370,29 +671,48 @@ def cmd_ab(args):
     sa = summarize(a_deltas, args.hands)
     sb = summarize(b_deltas, args.hands)
     sd = summarize(paired_diff, args.hands)
-    # paired t-stat on the per-match difference
+    sa_e = summarize(a_ev_deltas, args.hands)
+    sb_e = summarize(b_ev_deltas, args.hands)
+    sd_e = summarize(paired_ev_diff, args.hands)
+    # paired t-stat on the per-match difference (realized and EV-adjusted)
     t_stat = (sd["mean_delta"] / sd["stderr"]) if sd["stderr"] else 0.0
+    t_stat_ev = (sd_e["mean_delta"] / sd_e["stderr"]) if sd_e["stderr"] else 0.0
 
     if args.json:
-        print(json.dumps({"a": a_id, "b": b_id, "elapsed_s": round(elapsed, 2),
-                          "A": sa, "B": sb, "A_minus_B": sd, "t_stat": t_stat},
-                         indent=2))
+        print(json.dumps({
+            "a": a_id, "b": b_id, "elapsed_s": round(elapsed, 2),
+            "A": sa, "B": sb, "A_minus_B": sd, "t_stat": t_stat,
+            "A_ev": sa_e, "B_ev": sb_e, "A_minus_B_ev": sd_e,
+            "t_stat_ev": t_stat_ev,
+        }, indent=2))
         return
 
     print(f"\nA/B (paired) — {args.matches} matches x {args.hands} hands, "
           f"{n_seats}-handed, in {elapsed:.1f}s\n")
+    print("  realized:")
     for label, s in ((a_id, sa), (b_id, sb)):
-        print(f"  {label:<18} mean Δ/match {s['mean_delta']:>+12,.0f}   "
+        print(f"    {label:<18} mean Δ/match {s['mean_delta']:>+12,.0f}   "
               f"bb/100 {s['bb_per_100']:>+7.2f}")
-    print("-" * 56)
-    print(f"  A - B            mean Δ/match {sd['mean_delta']:>+12,.0f}   "
+    print("  " + "-" * 56)
+    print(f"    A - B            mean Δ/match {sd['mean_delta']:>+12,.0f}   "
           f"95% CI [{sd['ci_low']:+,.0f}, {sd['ci_high']:+,.0f}]")
-    print(f"  paired t-stat    {t_stat:>+.2f}  "
+    print(f"    paired t-stat    {t_stat:>+.2f}  "
           f"({'significant' if abs(t_stat) >= 1.96 else 'not significant'} at ~95%)")
 
-    if sd["ci_low"] > 0:
+    print("\n  EV-adjusted (variance-reduced):")
+    for label, s in ((a_id, sa_e), (b_id, sb_e)):
+        print(f"    {label:<18} mean Δ/match {s['mean_delta']:>+12,.1f}   "
+              f"bb/100 {s['bb_per_100']:>+7.2f}")
+    print("  " + "-" * 56)
+    print(f"    A - B (EV)       mean Δ/match {sd_e['mean_delta']:>+12,.1f}   "
+          f"95% CI [{sd_e['ci_low']:+,.1f}, {sd_e['ci_high']:+,.1f}]")
+    print(f"    paired t-stat    {t_stat_ev:>+.2f}  "
+          f"({'significant' if abs(t_stat_ev) >= 1.96 else 'not significant'} at ~95%)")
+
+    sig = sd_e if sd_e["stderr"] else sd
+    if sig["ci_low"] > 0:
         print(f"\n  => {a_id} beats {b_id}. The change is +EV. Ship it.")
-    elif sd["ci_high"] < 0:
+    elif sig["ci_high"] < 0:
         print(f"\n  => {a_id} is WORSE than {b_id}. Roll back (classifier too "
               f"noisy or exploit too aggressive).")
     else:
@@ -433,6 +753,12 @@ def main():
     common.add_argument("--no-fold-on-timeout", action="store_true")
     common.add_argument("--json", action="store_true")
     common.add_argument("--verbose", action="store_true")
+    common.add_argument("--no-ev", action="store_true",
+                        help="disable EV-adjustment (ev_chip_delta mirrors realized)")
+    common.add_argument("--ev-mc", type=int, default=4000,
+                        help="Monte-Carlo samples for >2-card run-outs (preflop all-ins)")
+    common.add_argument("--ev-debug", action="store_true",
+                        help="assert (instead of warn) if the river self-check fails")
 
     pe = sub.add_parser("eval", parents=[common],
                         help="one hero vs a field")

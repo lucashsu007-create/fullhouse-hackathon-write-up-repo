@@ -9,11 +9,14 @@ Run from the directory that contains this file and backtest.py:
 This version does NOT depend on backtest.py exposing run_eval()/run_ab().
 It imports the building blocks that backtest.py defines —
     make_ids, build_decide_map, run_match_inproc, summarize
-— and performs the eval / paired multi-hero orchestration locally (see _run_eval
-/ _run_multi below). That mirrors backtest.py's own cmd_eval / cmd_ab logic,
-match-for-match (generalising the A-vs-B path to 2–7 heroes), while also
-returning the richer result shape this dashboard's Results tab needs (per-match
-deltas, per-bot crash/timing counts) and threading a per-match progress callback.
+— and the eval / paired multi-hero orchestration lives in analysis.py (a pure,
+streamlit-free module that app.py wires to the harness via analysis.bind_harness).
+That mirrors backtest.py's own cmd_eval / cmd_ab logic, match-for-match
+(generalising the A-vs-B path to 2–7 heroes), while also returning the richer
+result shape this dashboard's Results tab needs (per-match realized + EV deltas,
+per-match placement, per-bot crash/timing counts) and threading a per-match
+progress callback. Keeping that logic in analysis.py makes it unit-testable with
+no engine, eval7, or streamlit present (see test_step2.py).
 
 Two correctness fixes over the previous revision:
   1. Duplicate seats are preserved. A preset like
@@ -41,7 +44,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
-import random
 import secrets
 import sys
 import time
@@ -249,169 +251,11 @@ if isinstance(_bt, Exception):
     st.stop()
 bt = _bt
 
-
-# ---------------------------------------------------------------------------
-# Local eval / AB orchestration (mirrors backtest.cmd_eval / cmd_ab exactly,
-# but returns the richer dashboard result shape and reports per-match progress)
-# ---------------------------------------------------------------------------
-
-def _hero_label(prefix: str, path: str) -> str:
-    """Same labelling backtest.cmd_ab uses: file stem, or parent dir when the
-    file is the conventional bot.py."""
-    pp = Path(path)
-    name = pp.stem
-    if name in ("bot",):
-        name = pp.parent.name or name
-    return prefix + name
-
-
-def _accumulate(dst_err, dst_tim, res):
-    """Fold one match's per-bot errors/timing into running totals."""
-    for bid, c in (res.get("errors") or {}).items():
-        dst_err[bid] = dst_err.get(bid, 0) + c
-    for bid, tinfo in (res.get("timing") or {}).items():
-        agg = dst_tim.setdefault(bid, {"max": 0.0, "slow": 0})
-        agg["max"] = max(agg["max"], (tinfo or {}).get("max", 0.0))
-        agg["slow"] += (tinfo or {}).get("slow", 0)
-
-
-def _run_eval(hero_path, opponent_paths, matches, hands, seed_base,
-              budget, fold_on_timeout, reload, rotate_seats,
-              progress_callback=None) -> dict:
-    """One hero vs a field of opponents. opponent_paths may contain duplicate
-    paths — make_ids gives each a distinct id (foo, foo_2, …) and build_decide_map
-    loads each under a unique module name, so duplicates seat independently with
-    independent state. Mirrors backtest.cmd_eval's seating/seeding."""
-    paths = [hero_path] + list(opponent_paths)
-    ids = bt.make_ids(paths)
-    hero_id = ids[0]
-    id_to_path = dict(zip(ids, paths))
-
-    per_bot = {bid: [] for bid in ids}
-    errors_total: dict = {}
-    timing_total: dict = {}
-
-    cached = None if reload else bt.build_decide_map(id_to_path)
-
-    t0 = time.time()
-    for i in range(matches):
-        seed = seed_base + i
-        order = ids[:]
-        if rotate_seats:
-            k = i % len(order)
-            order = order[k:] + order[:k]
-        else:
-            random.Random(seed * 7919 + 1).shuffle(order)
-
-        dm = (bt.build_decide_map({b: id_to_path[b] for b in order})
-              if reload else {b: cached[b] for b in order})
-
-        res = bt.run_match_inproc(dm, hands, seed, budget=budget,
-                                  fold_on_timeout=fold_on_timeout)
-        for bid, d in res["chip_delta"].items():
-            per_bot[bid].append(d)
-        _accumulate(errors_total, timing_total, res)
-
-        if progress_callback:
-            progress_callback(i + 1, matches)
-
-    elapsed = time.time() - t0
-    stats = {bid: bt.summarize(per_bot[bid], hands) for bid in ids}
-    return {
-        "elapsed_s": round(elapsed, 2),
-        "hero_id": hero_id,
-        "stats": stats,
-        "per_match_deltas": per_bot,
-        "errors": errors_total,
-        "timing": timing_total,
-    }
-
-
-def _run_multi(hero_specs, baseline_id, field_paths, matches, hands, seed_base,
-               budget, fold_on_timeout, progress_callback=None) -> dict:
-    """Paired N-way comparison (2..7 heroes) on identical seeds, identical seat,
-    identical (freshly loaded) field. Generalises the old A-vs-B path: at each
-    match index every hero plays its OWN match against the same field, in the
-    same seat, on the same seed — so all heroes are mutually paired and each
-    variant's per-match delta lines up index-for-index with every other's.
-
-    hero_specs: list of {"id", "path"} (caller guarantees 2..7 unique ids).
-    baseline_id: the hero id everyone else is compared against (paired diff).
-
-    Note: the engine's 9-seat cap applies to field + 1 hero per sub-match, NOT
-    to the number of heroes — each hero is seated alone against the field."""
-    field_ids = bt.make_ids(list(field_paths))
-    field_map = dict(zip(field_ids, field_paths))
-    n_seats = len(field_ids) + 1
-
-    # Seat label per hero. Ids are unique already; only disambiguate the rare
-    # case where a hero id collides with a generated field id.
-    hero_ids, hero_path = [], {}
-    field_set = set(field_ids)
-    for h in hero_specs:
-        hid = h["id"]
-        if hid in field_set or hid in hero_path:
-            hid = hid + "#h"
-        hero_ids.append(hid)
-        hero_path[hid] = h["path"]
-    if baseline_id not in hero_path:           # baseline got disambiguated too
-        baseline_id = hero_ids[0]
-
-    deltas = {hid: [] for hid in hero_ids}     # absolute chip Δ per match
-    errors_total: dict = {}
-    timing_total: dict = {}
-
-    t0 = time.time()
-    for i in range(matches):
-        seed = seed_base + i
-        hero_idx = i % n_seats  # same seat for every hero at this seed
-
-        def seated(hid):
-            order = field_ids[:]
-            order.insert(hero_idx, hid)
-            paths = {bid: (hero_path[hid] if bid == hid else field_map[bid])
-                     for bid in order}
-            dm = bt.build_decide_map({b: paths[b] for b in order})
-            return bt.run_match_inproc(dm, hands, seed, budget=budget,
-                                       fold_on_timeout=fold_on_timeout)
-
-        for hid in hero_ids:
-            res = seated(hid)
-            _accumulate(errors_total, timing_total, res)
-            deltas[hid].append(res["chip_delta"][hid])
-
-        if progress_callback:
-            progress_callback(i + 1, matches)
-
-    elapsed = time.time() - t0
-
-    # Per-hero absolute stats.
-    stats = {hid: bt.summarize(deltas[hid], hands) for hid in hero_ids}
-
-    # Paired (hero - baseline) per match, for every non-baseline hero.
-    base_deltas = deltas[baseline_id]
-    paired = {}        # hid -> list of per-match (hid - baseline)
-    vs_baseline = {}   # hid -> {"stats": summarize(paired), "t_stat": ...}
-    for hid in hero_ids:
-        if hid == baseline_id:
-            continue
-        pd = [a - b for a, b in zip(deltas[hid], base_deltas)]
-        paired[hid] = pd
-        sd = bt.summarize(pd, hands)
-        t_stat = (sd["mean_delta"] / sd["stderr"]) if sd["stderr"] else 0.0
-        vs_baseline[hid] = {"stats": sd, "t_stat": t_stat}
-
-    return {
-        "elapsed_s": round(elapsed, 2),
-        "baseline": baseline_id,
-        "hero_ids": hero_ids,
-        "stats": stats,                       # absolute, per hero
-        "vs_baseline": vs_baseline,           # paired diff vs baseline
-        "per_match_deltas": deltas,           # absolute, per hero
-        "per_match_paired": paired,           # (hero - baseline), per non-baseline hero
-        "errors": errors_total,
-        "timing": timing_total,
-    }
+# Wire the pure orchestration / IO / schema module to the harness. analysis.py
+# imports no streamlit and never hard-imports backtest, so it stays unit-testable
+# in isolation; here we inject the harness primitives + engine constants into it.
+import analysis  # noqa: E402  (after the late backtest import, by design)
+analysis.bind_harness(bt)
 
 
 # ---------------------------------------------------------------------------
@@ -653,62 +497,15 @@ def make_ab_job(label, heroes, baseline, opponents, preset_name, params) -> dict
     return job
 
 
-def out_path_safe(obj):
-    """Replace NaN/Inf with None so the output is valid JSON."""
-    if isinstance(obj, dict):
-        return {k: out_path_safe(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [out_path_safe(v) for v in obj]
-    if isinstance(obj, float):
-        if obj != obj or obj in (float("inf"), float("-inf")):
-            return None
-    return obj
-
-
-def write_result_json(job, results_dir, result, error) -> Path:
-    """Persist one JSON per job (schema_version 2)."""
-    base = {
-        "schema_version": 2,
-        "metadata": {
-            "job_id": job["job_id"],
-            "label": job["label"],
-            "mode": job["mode"],
-            "created_at": job["created_at"],
-            "started_at": job["started_at"],
-            "completed_at": job["completed_at"],
-        },
-        "mode": job["mode"],
-        "opponents": job["opponents"],
-        "preset_name": job["preset_name"],
-        "params": job["params"],
-        "elapsed_s": (result or {}).get("elapsed_s"),
-        "stats": (result or {}).get("stats"),
-        "per_match_deltas": (result or {}).get("per_match_deltas"),
-        "errors_per_bot": (result or {}).get("errors"),
-        "timing_per_bot": (result or {}).get("timing"),
-        "error": error,
-    }
-    if job["mode"] == "eval":
-        base["hero"] = job["hero"]
-    elif job["mode"] == "ab":
-        base["heroes"] = job["heroes"]
-        base["baseline"] = job["baseline"]
-        base["vs_baseline"] = (result or {}).get("vs_baseline")
-        base["per_match_paired"] = (result or {}).get("per_match_paired")
-
-    out_path = Path(results_dir) / f"{job['job_id']}.json"
-    out_path.write_text(json.dumps(out_path_safe(base), indent=2))
-    return out_path
-
-
 def run_job(job, results_dir, progress_callback=None) -> None:
-    """Execute one job. Always writes a result JSON, even on failure."""
+    """Execute one job. Always writes a result JSON, even on failure. The actual
+    orchestration + result IO live in analysis.py (pure, streamlit-free)."""
     job["status"] = "running"
     job["started_at"] = _now_iso()
     try:
         params = job["params"]
         if job["mode"] == "eval":
-            result = _run_eval(
+            result = analysis._run_eval(
                 hero_path=job["hero"]["path"],
                 opponent_paths=[o["path"] for o in job["opponents"]],
                 matches=params["matches"],
@@ -721,7 +518,7 @@ def run_job(job, results_dir, progress_callback=None) -> None:
                 progress_callback=progress_callback,
             )
         elif job["mode"] == "ab":
-            result = _run_multi(
+            result = analysis._run_multi(
                 hero_specs=job["heroes"],
                 baseline_id=job["baseline"],
                 field_paths=[o["path"] for o in job["opponents"]],
@@ -737,7 +534,7 @@ def run_job(job, results_dir, progress_callback=None) -> None:
 
         job["completed_at"] = _now_iso()
         job["elapsed_s"] = result["elapsed_s"]
-        out_path = write_result_json(job, results_dir, result, None)
+        out_path = analysis.write_result_json(job, results_dir, result, None)
         job["result_path"] = str(out_path)
         job["status"] = "done"
     except Exception as exc:
@@ -748,7 +545,7 @@ def run_job(job, results_dir, progress_callback=None) -> None:
         }
         job["completed_at"] = _now_iso()
         job["error"] = err
-        out_path = write_result_json(job, results_dir, None, err)
+        out_path = analysis.write_result_json(job, results_dir, None, err)
         job["result_path"] = str(out_path)
         job["status"] = "error"
 
@@ -1269,56 +1066,439 @@ with tab_run:
 
 
 # ---------------------------------------------------------------------------
-# Tab 3 — Results
+# Tab 3 — Results: stats engine + hero × preset matrix (Step 3)
 # ---------------------------------------------------------------------------
+# All stats / grouping / matrix logic lives in analysis.py (pure, streamlit-
+# free, unit-tested). Everything below is rendering only. The matrix is the
+# centerpiece: rows = non-baseline heroes, cols = probes (preset / field
+# signature), each cell a paired (hero − baseline) stat recomputed live from the
+# stored per-match series for the selected series + baseline + metric. The
+# eval-mode inspector further down is unchanged.
 
-def _normalize_legacy_result(d: dict) -> dict:
-    """Translate v1 (CLI-flat) JSON files into the v2 dashboard shape. No-op on
-    anything already v2-shaped or unrecognised (pass-through; the inspector
-    degrades gracefully via .get())."""
-    if d.get("schema_version") == 2 or "metadata" in d:
-        return d
+# Series the user can compute the matrix / tables on. EV is the default dev
+# metric (lower variance, unbiased); placement is the finals-oriented series.
+_SERIES_OPTIONS = [
+    ("ev", "EV-adjusted"),
+    ("realized", "Realized"),
+    ("placement", "Placement"),
+]
+_SERIES_LABEL = dict(_SERIES_OPTIONS)
 
-    if {"A", "B", "A_minus_B"} <= set(d.keys()):
-        a = d.get("a", "A")
-        b = d.get("b", "B")
-        a_stats = d.get("A") or {}
-        return {
-            **d, "schema_version": 2, "mode": "ab",
-            "metadata": {"job_id": f"legacy_{a}_{b}", "label": f"legacy: {a} vs {b}",
-                         "mode": "ab", "created_at": None, "started_at": None,
-                         "completed_at": None},
-            "hero_a": {"id": a, "path": ""}, "hero_b": {"id": b, "path": ""},
-            "opponents": [], "preset_name": None,
-            "params": {"matches": a_stats.get("matches"), "hands": 400,
-                       "seed_base": None, "budget": None, "fold_on_timeout": None},
-            "stats": {"A": d["A"], "B": d["B"], "A_minus_B": d["A_minus_B"]},
-            "t_stat": d.get("t_stat"), "elapsed_s": d.get("elapsed_s"),
-            "per_match_deltas": None, "errors_per_bot": None,
-            "timing_per_bot": None, "error": None, "_legacy": "ab_v1",
-        }
 
-    if isinstance(d.get("hero"), str) and isinstance(d.get("stats"), dict):
-        hero_str = d["hero"]
-        stats = d["stats"]
-        hero_stats = stats.get(hero_str) or {}
-        return {
-            **d, "schema_version": 2, "mode": "eval",
-            "metadata": {"job_id": f"legacy_{hero_str}", "label": f"legacy: {hero_str}",
-                         "mode": "eval", "created_at": None, "started_at": None,
-                         "completed_at": None},
-            "hero": {"id": hero_str, "path": ""},
-            "opponents": [{"id": bid, "path": ""} for bid in stats.keys() if bid != hero_str],
-            "preset_name": None,
-            "params": {"matches": hero_stats.get("matches"), "hands": 400,
-                       "seed_base": None, "budget": None, "fold_on_timeout": None,
-                       "reload": None, "rotate_seats": None},
-            "stats": stats, "elapsed_s": d.get("elapsed_s"),
-            "per_match_deltas": None, "errors_per_bot": None,
-            "timing_per_bot": None, "error": None, "_legacy": "eval_v1",
-        }
+def _series_available(result, series_key) -> bool:
+    return bool(analysis.series_arrays(result, series_key))
 
-    return d
+
+def _fmt_metric(value, metric) -> str:
+    """Display string for a matrix cell value under the chosen metric."""
+    if value is None or (isinstance(value, float) and value != value):
+        return "·"
+    if metric == "bb/100":
+        return f"{value:+.2f}"
+    if metric == "chips":
+        return f"{value:+.0f}"
+    if metric == "t":
+        return f"{value:+.2f}"
+    if metric == "p":
+        return f"{value:.3f}"
+    return str(value)
+
+
+def _cell_bg(value, metric, vmax) -> str:
+    """Diverging background centered at 0 (matplotlib if present). For p we use a
+    light sequential shade (smaller p = stronger). Empty when no matplotlib or
+    no value."""
+    if not _HAS_MPL or value is None or (isinstance(value, float) and value != value):
+        return ""
+    try:
+        if metric == "p":
+            # smaller p → stronger highlight (sequential, reversed)
+            frac = max(0.0, min(1.0, 1.0 - float(value)))
+            r, g, b, _ = matplotlib.colormaps["Purples"](0.15 + 0.6 * frac)
+        else:
+            if not vmax or vmax != vmax:
+                return ""
+            norm = max(-1.0, min(1.0, float(value) / vmax))
+            # higher = better → blue end; lower = worse → red end
+            r, g, b, _ = matplotlib.colormaps["RdBu"](0.5 + 0.5 * norm)
+        return f"background-color: rgb({int(r*255)},{int(g*255)},{int(b*255)});"
+    except Exception:
+        return ""
+
+
+def _text_color_for(bg_style: str) -> str:
+    """Pick black/white text for contrast against an 'rgb(r,g,b)' bg style."""
+    if not bg_style:
+        return ""
+    try:
+        nums = bg_style.split("rgb(", 1)[1].split(")", 1)[0].split(",")
+        r, g, b = (int(x) for x in nums)
+        lum = 0.299 * r + 0.587 * g + 0.114 * b
+        return "color: #000;" if lum > 140 else "color: #fff;"
+    except Exception:
+        return ""
+
+
+def _render_matrix_html(matrix_by_probe, hero_rows, probes, baseline,
+                        metric, series_key) -> str:
+    """Hand-built HTML table for the hero × probe matrix with diverging color +
+    Holm markers. matrix_by_probe[probe] = {hero: {'value','holm_p','significant'}}.
+    Color is driven by analysis.matrix_color_value so the 'better' direction is
+    always the positive (blue) end — on placement (lower rank = better) the sign
+    is inverted, so the displayed Δ rank can be negative while colored 'better'."""
+    # Global max-abs over the SIGN-ADJUSTED color values (== abs(value)).
+    vals = []
+    for probe in probes:
+        for hid in hero_rows:
+            c = matrix_by_probe.get(probe, {}).get(hid)
+            if c and isinstance(c.get("value"), (int, float)) and c["value"] == c["value"]:
+                vals.append(abs(c["value"]))
+    vmax = max(vals) if vals else 0.0
+
+    head = "".join(f"<th style='padding:4px 8px;text-align:right;'>{p}</th>"
+                   for p in probes)
+    rows_html = []
+    for hid in hero_rows:
+        tds = [f"<td style='padding:4px 8px;font-weight:600;white-space:nowrap;'>"
+               f"{hid} − {baseline}</td>"]
+        for probe in probes:
+            c = matrix_by_probe.get(probe, {}).get(hid)
+            if not c:
+                tds.append("<td style='padding:4px 8px;text-align:right;color:#999;'>·</td>")
+                continue
+            color_val = analysis.matrix_color_value(c.get("value"), series_key)
+            bg = _cell_bg(color_val, metric, vmax)
+            txt = _text_color_for(bg)
+            mark = " <sup>✲</sup>" if c.get("significant") else ""
+            tds.append(
+                f"<td style='padding:4px 8px;text-align:right;{bg}{txt}'>"
+                f"{_fmt_metric(c.get('value'), metric)}{mark}</td>")
+        rows_html.append("<tr>" + "".join(tds) + "</tr>")
+    return (
+        "<table style='border-collapse:collapse;font-size:0.9rem;'>"
+        f"<thead><tr><th style='padding:4px 8px;text-align:left;'>"
+        f"hero − {baseline} ({_SERIES_LABEL.get(series_key, series_key)})</th>"
+        f"{head}</tr></thead><tbody>{''.join(rows_html)}</tbody></table>"
+    )
+
+
+def _render_comparison_matrix(all_results):
+    """The Step-3 centerpiece: comparison-set selector → series / baseline /
+    metric toggles → live hero × probe paired matrix + collapsed absolute
+    companion. `all_results` is a list of normalized result dicts."""
+    groups = analysis.group_results(all_results)
+    if not groups:
+        st.info("No paired (ab) results with a hero set yet — run a 2–7 hero "
+                "comparison to populate the matrix.")
+        return
+
+    # Default to the most-recent set; selector switches sets.
+    default_key = analysis.most_recent_set_key(all_results)
+    keys = list(groups.keys())
+    key_labels = {k: ", ".join(k) for k in keys}
+    default_idx = keys.index(default_key) if default_key in keys else 0
+    chosen_label = st.selectbox(
+        "Comparison set (heroes)",
+        options=[key_labels[k] for k in keys],
+        index=default_idx,
+        key="matrix_set",
+    )
+    chosen_key = keys[[key_labels[k] for k in keys].index(chosen_label)]
+    grp = groups[chosen_key]
+    heroes = grp["heroes"]
+    probes = list(grp["probes"].keys())
+
+    c1, c2, c3 = st.columns([2, 2, 3])
+    # Series toggle — restrict to series actually present in this set's winners.
+    winners = [b["winner"] for b in grp["probes"].values()]
+    avail = [(k, lbl) for k, lbl in _SERIES_OPTIONS
+             if any(_series_available(w, k) for w in winners)]
+    if not avail:
+        avail = [("realized", "Realized")]
+    series_key = c1.radio(
+        "Series", options=[k for k, _ in avail],
+        format_func=lambda k: _SERIES_LABEL.get(k, k),
+        index=0, key="matrix_series", horizontal=True,
+    )
+    baseline = c2.selectbox(
+        "Baseline (paired against)", options=heroes,
+        index=0, key="matrix_baseline",
+    )
+    # Metric set depends on the series: bb/100 is meaningless on ranks, so the
+    # placement series offers chips (= mean Δ rank) / t / p only. Per-series key
+    # keeps the radio from holding a now-hidden metric across a series switch.
+    metric_opts = analysis.metrics_for_series(series_key)
+    metric = c3.radio(
+        "Metric", options=metric_opts,
+        index=0, key=f"matrix_metric_{series_key}", horizontal=True,
+    )
+
+    hero_rows = [h for h in heroes if h != baseline]
+    if not hero_rows:
+        st.caption("Only the baseline is in this set — nothing to compare.")
+        return
+
+    # Build each probe column from its newest result, Holm across the WHOLE
+    # matrix (every (hero, probe) cell shown).
+    matrix_by_probe = {}
+    raw_ps, cell_index = [], []
+    field, _lbl = analysis.MATRIX_METRICS[metric]
+    for probe in probes:
+        winner = grp["probes"][probe]["winner"]
+        col = {}
+        for hid in hero_rows:
+            cell = analysis.matrix_cell(winner, hid, baseline, series_key)
+            if cell is None:
+                continue
+            col[hid] = {"value": cell.get(field), "raw_p": cell.get("p_value"),
+                        "cell": cell}
+            raw_ps.append(cell.get("p_value"))
+            cell_index.append((probe, hid))
+        matrix_by_probe[probe] = col
+    clean = [p if isinstance(p, (int, float)) and p == p else 1.0 for p in raw_ps]
+    holm = analysis.holm_adjust(clean)
+    for (probe, hid), hp in zip(cell_index, holm):
+        matrix_by_probe[probe][hid]["holm_p"] = hp
+        matrix_by_probe[probe][hid]["significant"] = (
+            isinstance(hp, (int, float)) and hp < 0.05)
+
+    captions = []
+    for probe in probes:
+        captions.append(f"{probe} ({grp['probes'][probe]['n_runs']} run"
+                        f"{'s' if grp['probes'][probe]['n_runs'] != 1 else ''})")
+    st.caption("Probes (newest run per probe used): " + "  ·  ".join(captions))
+
+    if _HAS_MPL:
+        st.markdown(
+            _render_matrix_html(matrix_by_probe, hero_rows, probes, baseline,
+                                metric, series_key),
+            unsafe_allow_html=True,
+        )
+        _color_note = ("color inverted so green/blue = better (lower rank); "
+                       if series_key == "placement"
+                       else "diverging color centered at 0; ")
+        st.caption("Cell = paired (hero − baseline) "
+                   f"{analysis.matrix_value_label(series_key, metric)} on the "
+                   f"{_SERIES_LABEL.get(series_key, series_key)} series, "
+                   f"recomputed live. {_color_note}"
+                   "✲ = Holm-significant at 5% across the matrix.")
+    else:
+        # No matplotlib → plain dataframe (no color), Holm marker inline.
+        df_rows = []
+        for hid in hero_rows:
+            row = {"hero − baseline": f"{hid} − {baseline}"}
+            for probe in probes:
+                c = matrix_by_probe.get(probe, {}).get(hid)
+                txt = _fmt_metric(c.get("value") if c else None, metric)
+                if c and c.get("significant"):
+                    txt += " ✲"
+                row[probe] = txt
+            df_rows.append(row)
+        st.dataframe(df_rows, use_container_width=True, hide_index=True)
+        st.caption("Install matplotlib for diverging color: `pip install matplotlib`. "
+                   "✲ = Holm-significant at 5%.")
+
+    # Collapsed absolute companion: all heroes (incl. baseline) × probes.
+    with st.expander("Absolute matrix (all heroes incl. baseline)", expanded=False):
+        abs_metric = "mean_bb_per_100" if metric in ("bb/100", "t", "p") else "mean_chips"
+        abs_label = "mean bb/100" if abs_metric == "mean_bb_per_100" else "mean chips"
+        abs_rows = []
+        for hid in heroes:
+            row = {"hero": hid + ("  ←base" if hid == baseline else "")}
+            for probe in probes:
+                winner = grp["probes"][probe]["winner"]
+                am = analysis.absolute_matrix(winner, [hid], series_key).get(hid)
+                if not am:
+                    row[probe] = "·"
+                else:
+                    v = am[abs_metric]
+                    row[probe] = (f"{v:+.2f}" if abs_metric == "mean_bb_per_100"
+                                  else f"{v:+.0f}")
+            abs_rows.append(row)
+        st.caption(f"Absolute {abs_label} on the "
+                   f"{_SERIES_LABEL.get(series_key, series_key)} series "
+                   "(not paired — for context only).")
+        st.dataframe(abs_rows, use_container_width=True, hide_index=True)
+
+    # --- Matrix export ---------------------------------------------------
+    set_tag = "_".join(chosen_key)
+    try:
+        st.download_button(
+            "⤓ Matrix CSV",
+            data=analysis.matrix_csv(grp, baseline, series_key, metric),
+            file_name=f"matrix_{set_tag}_{series_key}_{metric.replace('/', '')}.csv",
+            mime="text/csv", key=f"dl_matrix_{set_tag}_{series_key}_{metric}",
+        )
+    except Exception as exc:                       # pragma: no cover - UI guard
+        st.caption(f"(matrix CSV unavailable: {exc})")
+
+    st.caption("⚠ Pairing is valid only within a column (probe), never across "
+               "probes. Effect size + CI beat t alone (t inflates with N); Holm "
+               "guards the multiple comparisons shown here.")
+
+    # --- Placement view (primary placement surface) ----------------------
+    if any(analysis.series_arrays(grp["probes"][p]["winner"], "placement")
+           for p in probes):
+        st.markdown("#### Placement view")
+        st.caption("Finals-oriented: mean finish rank (lower = better), P(1st) = "
+                   "sole-win rate, P(top-k) from each probe's stored ranks.")
+        max_seats = 0
+        for probe in probes:
+            for hid in heroes:
+                vals = analysis.series_arrays(grp["probes"][probe]["winner"],
+                                              "placement").get(hid) or []
+                if vals:
+                    max_seats = max(max_seats, int(max(vals)))
+        ks = tuple(k for k in (1, 2, 3) if k <= max(max_seats, 1))
+        for probe in probes:
+            winner = grp["probes"][probe]["winner"]
+            agg = analysis.placement_aggregates(winner, heroes, ks=ks)
+            prows = []
+            for hid in heroes:
+                a = agg.get(hid)
+                if not a or not a.get("n"):
+                    continue
+                row = {"hero": hid + ("  ←base" if hid == baseline else ""),
+                       "mean rank": round(a["mean_rank"], 3),
+                       "P(1st)": round(a["p_first"], 3)}
+                for k in ks:
+                    if k > 1:
+                        row[f"P(top-{k})"] = round(a["p_top"][k], 3)
+                prows.append(row)
+            prows.sort(key=lambda r: r["mean rank"])
+            st.markdown(f"**{probe}**")
+            st.dataframe(prows, use_container_width=True, hide_index=True)
+
+    # --- Drill-down: one probe → its result → pairwise + gap + histogram --
+    st.markdown("#### Drill-down (one probe)")
+    probe_sel = st.selectbox(
+        "Probe to drill into", options=probes, index=0,
+        key=f"drill_probe_{set_tag}",
+    )
+    winner = grp["probes"][probe_sel]["winner"]
+    d_series_avail = [(k, lbl) for k, lbl in _SERIES_OPTIONS
+                      if _series_available(winner, k)] or [("realized", "Realized")]
+    dc1, dc2 = st.columns([2, 2])
+    d_series = dc1.radio(
+        "Series", options=[k for k, _ in d_series_avail],
+        format_func=lambda k: _SERIES_LABEL.get(k, k), index=0,
+        key=f"drill_series_{set_tag}", horizontal=True,
+    )
+    pairing_mode = dc2.radio(
+        "Pairing", options=["vs baseline", "full pairwise"], index=0,
+        key=f"drill_pairmode_{set_tag}", horizontal=True,
+    )
+    drill_baseline = baseline if pairing_mode == "vs baseline" else None
+
+    rows = analysis.pairwise_table(winner, d_series, baseline=drill_baseline)
+    if rows:
+        is_placement = (d_series == "placement")
+        chip_label = "mean Δ rank" if is_placement else "mean Δ chips"
+        table = []
+        for r in rows:
+            entry = {
+                "pair": r["pair"],
+                "n": r["n"],
+                chip_label: round(r["mean_chips"], 3),
+            }
+            if not is_placement:
+                entry["mean Δ bb/100"] = round(r["mean_bb_per_100"], 3)
+            entry.update({
+                "stderr": round(r["stderr"], 2),
+                "t": round(r["t"], 3),
+                "df": r["df"],
+                "p": round(r["p_value"], 4),
+                "Holm p": round(r["holm_p"], 4),
+                "95% CI": f"[{r['ci_low']:+.0f}, {r['ci_high']:+.0f}]",
+                "median Δ": round(r["median_chips"], 3),
+                "Wilcoxon p": round(r["wilcoxon_p"], 4),
+                "sig@Holm5%": "✲" if r.get("significant") else "",
+            })
+            table.append(entry)
+        st.dataframe(table, use_container_width=True, hide_index=True)
+        if is_placement:
+            st.caption("Placement pairwise: mean Δ rank < 0 ⇒ the hero finishes "
+                       "ahead of the other. bb/100 omitted (meaningless on ranks).")
+        else:
+            st.caption("Paired (cand − base) on identical seeds/seats. Holm across "
+                       "the rows shown; CI is mean ± t·stderr.")
+
+        # Pairwise CSV + raw per-match CSV downloads for this probe.
+        ec1, ec2 = st.columns([1, 1])
+        ec1.download_button(
+            "⤓ Pairwise CSV",
+            data=analysis.pairwise_csv(winner, d_series, baseline=drill_baseline),
+            file_name=f"pairwise_{set_tag}_{probe_sel}_{d_series}.csv",
+            mime="text/csv", key=f"dl_pw_{set_tag}_{probe_sel}_{d_series}",
+        )
+        ec2.download_button(
+            "⤓ Raw per-match CSV",
+            data=analysis.raw_per_match_csv(winner),
+            file_name=f"rawmatches_{set_tag}_{probe_sel}.csv",
+            mime="text/csv", key=f"dl_raw_{set_tag}_{probe_sel}",
+        )
+
+    # Realized − EV gap (luck indicator) for this probe's heroes.
+    if (analysis.series_arrays(winner, "realized")
+            and analysis.series_arrays(winner, "ev")):
+        gap_rows = []
+        for hid in analysis.hero_ids_of(winner):
+            mr, me, gap = analysis.realized_ev_gap(winner, hid)
+            if mr != mr:
+                continue
+            gap_rows.append({
+                "hero": hid,
+                "mean realized": round(mr, 1),
+                "mean EV": round(me, 1),
+                "realized − EV (luck)": round(gap, 1),
+            })
+        if gap_rows:
+            with st.expander("Realized − EV gap (per-hero luck)", expanded=False):
+                st.dataframe(gap_rows, use_container_width=True, hide_index=True)
+
+    # Series-aware per-match histogram for this probe.
+    if not _HAS_MPL:
+        st.caption("Install matplotlib for the per-match histogram: "
+                   "`pip install matplotlib`")
+    else:
+        hc1, hc2 = st.columns([2, 2])
+        hist_hero = hc1.selectbox(
+            "Histogram hero", options=heroes, index=0,
+            key=f"hist_hero_{set_tag}",
+        )
+        hist_mode = hc2.radio(
+            "Values", options=["paired (vs baseline)", "absolute"], index=0,
+            key=f"hist_mode_{set_tag}", horizontal=True,
+        )
+        paired = hist_mode.startswith("paired") and hist_hero != baseline
+        deltas = analysis.select_series_array(
+            winner, d_series, hist_hero,
+            baseline_id=baseline, paired=paired)
+        if deltas:
+            mean_v = sum(deltas) / len(deltas)
+            fig, ax = plt.subplots(figsize=(8, 3))
+            ax.hist(deltas, bins=min(40, max(10, len(deltas) // 5)),
+                    alpha=0.75, edgecolor="black", linewidth=0.4)
+            ax.axvline(0, color="black", linewidth=1, linestyle="-", alpha=0.5)
+            ax.axvline(mean_v, color="crimson", linewidth=1.5, linestyle="--",
+                       label=f"mean = {mean_v:+.2f}")
+            unit = ("rank" if d_series == "placement" else "chip Δ")
+            kind = (f"{hist_hero} − {baseline}" if paired else hist_hero)
+            ax.set_xlabel(f"{kind} {unit}  "
+                          f"({_SERIES_LABEL.get(d_series, d_series)}, n={len(deltas)})")
+            ax.set_ylabel("matches")
+            ax.set_title(f"{kind} — {_SERIES_LABEL.get(d_series, d_series)}")
+            ax.legend(loc="upper right", fontsize=9)
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+        else:
+            st.caption("No data for this series/hero.")
+
+    st.caption("⚠ Pairing is valid only within a column (probe), never across "
+               "probes. Effect size + CI beat t alone (t inflates with N); Holm "
+               "guards the multiple comparisons shown here.")
 
 
 with tab_results:
@@ -1334,7 +1514,7 @@ with tab_results:
         index_rows = []
         for f in files:
             try:
-                d = _normalize_legacy_result(json.loads(f.read_text()))
+                d = analysis.normalize_result(json.loads(f.read_text()))
                 mode = d.get("mode") or (d.get("metadata") or {}).get("mode") or "eval"
                 if mode == "eval":
                     hero_repr = (d.get("hero") or {}).get("id") or ""
@@ -1387,6 +1567,20 @@ with tab_results:
                 })
         st.dataframe(index_rows, use_container_width=True, hide_index=True)
 
+        # --- Step-3 centerpiece: hero × preset comparison matrix --------------
+        # Load + normalize every result once; group into comparison sets inside
+        # analysis.group_results. Failures to parse are skipped silently here
+        # (they already show as errors in the index table above).
+        st.markdown("---")
+        st.markdown("### Hero × preset matrix")
+        _all_results = []
+        for f in files:
+            try:
+                _all_results.append(analysis.normalize_result(json.loads(f.read_text())))
+            except Exception:
+                continue
+        _render_comparison_matrix(_all_results)
+
         st.markdown("---")
         st.markdown("**Inspect one result**")
         selected_name = st.selectbox(
@@ -1395,7 +1589,7 @@ with tab_results:
         selected = next((f for f in files if f.name == selected_name), None)
         if selected:
             try:
-                data = _normalize_legacy_result(json.loads(selected.read_text()))
+                data = analysis.normalize_result(json.loads(selected.read_text()))
             except Exception as exc:
                 st.error(f"Could not parse {selected.name}: {exc}")
                 data = None

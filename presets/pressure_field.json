@@ -1,0 +1,10 @@
+{
+  "name": "pressure_field",
+  "bot_ids": [
+    "pressure_bot",
+    "pressure_bot",
+    "pressure_bot",
+    "multi_barrel",
+    "balanced_lag"
+  ]
+}

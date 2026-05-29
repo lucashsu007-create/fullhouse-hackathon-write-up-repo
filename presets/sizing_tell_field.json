@@ -1,0 +1,10 @@
+{
+  "name": "sizing_tell_field",
+  "bot_ids": [
+    "sizing_reader",
+    "sizing_reader",
+    "sizing_reader",
+    "sizing_reader",
+    "balanced_lag"
+  ]
+}

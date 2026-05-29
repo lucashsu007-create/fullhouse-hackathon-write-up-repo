@@ -45,7 +45,10 @@ import datetime as dt
 import json
 import os
 import secrets
+import shutil
 import sys
+import tempfile
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -65,6 +68,10 @@ except Exception:
 
 # Engine seat cap (PokerEngine asserts 2 <= players <= MAX_PLAYERS, MAX=9).
 MAX_SEATS = 9
+
+# Marker stamped on the single combined JSON a batch sweep produces. The
+# Results tab recognises it and expands the bundle back into its member results.
+BATCH_RESULT_KIND = "batch_sweep"
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +106,7 @@ DEFAULT_BOTS_DIR = _pick_default_bots_dir()
 DEFAULT_HEROES_DIR = APP_DIR / "hero_bots"   # uploaded / test bots live here
 DEFAULT_PRESETS_DIR = APP_DIR / "presets"
 DEFAULT_RESULTS_DIR = APP_DIR / "results"
+DEFAULT_HISTORIES_DIR = APP_DIR / "histories"   # downloadable D1 hand histories
 
 
 def _bootstrap_presets(presets_dir) -> None:
@@ -153,6 +161,7 @@ def _init_state() -> None:
     ss.setdefault("heroes_dir", str(DEFAULT_HEROES_DIR))
     ss.setdefault("presets_dir", str(DEFAULT_PRESETS_DIR))
     ss.setdefault("results_dir", str(DEFAULT_RESULTS_DIR))
+    ss.setdefault("histories_dir", str(DEFAULT_HISTORIES_DIR))
     ss.setdefault("queue", [])           # list of job dicts
     _bootstrap_presets(ss["presets_dir"])
 
@@ -187,11 +196,18 @@ with st.sidebar:
     )
     st.session_state.presets_dir = st.text_input("Presets dir", value=st.session_state.presets_dir)
     st.session_state.results_dir = st.text_input("Results dir", value=st.session_state.results_dir)
+    st.session_state.histories_dir = st.text_input(
+        "D1 histories dir",
+        value=st.session_state.histories_dir,
+        help="Where downloadable D1 hand-history JSON lives. The D1 Profiler tab "
+             "reads from here; you can also upload files into it from that tab.",
+    )
 
     for _p in (st.session_state.heroes_dir,
                st.session_state.bots_dir,
                st.session_state.presets_dir,
-               st.session_state.results_dir):
+               st.session_state.results_dir,
+               st.session_state.histories_dir):
         Path(_p).mkdir(parents=True, exist_ok=True)
 
     def _count_bots(d):
@@ -256,6 +272,19 @@ bt = _bt
 # in isolation; here we inject the harness primitives + engine constants into it.
 import analysis  # noqa: E402  (after the late backtest import, by design)
 analysis.bind_harness(bt)
+
+# Optional: the D1 hand-history profiler / range calibrator. It's a pure,
+# stdlib-only, streamlit-free sibling module (like analysis.py), so it imports
+# cleanly on its own; if the file is missing the dashboard still runs and the
+# "D1 Profiler" tab just shows how to add it.
+d1_profiler = None
+_HAS_PROFILER = False
+_PROFILER_IMPORT_ERR = None
+try:
+    import d1_profiler  # noqa: E402
+    _HAS_PROFILER = True
+except Exception as exc:  # pragma: no cover - import-environment dependent
+    _PROFILER_IMPORT_ERR = exc
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +500,8 @@ def _base_job(mode: str, label: str, preset_name: str | None, params: dict) -> d
         "elapsed_s": None,
         "result_path": None,
         "error": None,
+        "batch_id": None,      # set on sweep jobs so they fold into one JSON
+        "batch_label": None,
     }
 
 
@@ -497,9 +528,20 @@ def make_ab_job(label, heroes, baseline, opponents, preset_name, params) -> dict
     return job
 
 
-def run_job(job, results_dir, progress_callback=None) -> None:
+def run_job(job, results_dir, progress_callback=None, repo_path=None):
     """Execute one job. Always writes a result JSON, even on failure. The actual
-    orchestration + result IO live in analysis.py (pure, streamlit-free)."""
+    orchestration + result IO live in analysis.py (pure, streamlit-free).
+
+    Returns the exact on-disk payload that was written (parsed back from the
+    file) so callers can bundle several results — e.g. a batch sweep folding all
+    its jobs into one combined JSON — without re-deriving the result schema.
+    Returns None if the written file can't be read back.
+
+    ``repo_path`` (the engine-repo path forwarded to worker processes) can be
+    passed explicitly; this lets the background queue worker avoid touching
+    ``st.session_state``, which is unsafe off the main thread. When omitted we
+    fall back to session_state, guarded so a non-main thread can't crash on it.
+    """
     job["status"] = "running"
     job["started_at"] = _now_iso()
     try:
@@ -510,7 +552,14 @@ def run_job(job, results_dir, progress_callback=None) -> None:
         # original serial behavior; an empty repo_path means "let backtest's
         # auto-discovery find the engine" (same as the parent).
         n_workers = int(params.get("workers", 1) or 1)
-        worker_repo_path = (st.session_state.get("repo_path") or "").strip() or None
+        if repo_path is None:
+            # Main-thread fallback only; guarded so the background worker (which
+            # passes repo_path explicitly) never hits session_state off-thread.
+            try:
+                repo_path = (st.session_state.get("repo_path") or "").strip() or None
+            except Exception:
+                repo_path = None
+        worker_repo_path = repo_path
         if job["mode"] == "eval":
             result = analysis._run_eval(
                 hero_path=job["hero"]["path"],
@@ -560,6 +609,204 @@ def run_job(job, results_dir, progress_callback=None) -> None:
         job["result_path"] = str(out_path)
         job["status"] = "error"
 
+    # Hand back the exact JSON that landed on disk (works for both the success
+    # and error branches, since result_path is set in both).
+    try:
+        return json.loads(Path(job["result_path"]).read_text())
+    except Exception:
+        return None
+
+
+def _combined_batch_path(results_dir, batch_id, batch_label) -> Path:
+    """Build the on-disk path for a batch's combined JSON. A short random token
+    keeps separate *runs* of the same queued sweep (e.g. after a Stop + re-run)
+    from overwriting each other, while staying stable within a single run so the
+    bundle can be refreshed in place as jobs complete."""
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "_"
+                   for c in str(batch_label))[:60].strip("_") or "sweep"
+    token = secrets.token_hex(2)
+    return Path(results_dir) / f"batch_{safe}_{batch_id}_{token}.json"
+
+
+def _write_combined_batch_json(out_path, batch_id, batch_label,
+                               jobs, member_payloads) -> Path:
+    """Fold every result produced by one batch sweep into a SINGLE JSON file.
+
+    ``out_path`` is the destination (see ``_combined_batch_path``). The bundle is
+    tagged ``kind == BATCH_RESULT_KIND`` and stores each member result under
+    ``"results"`` verbatim — every member is exactly the dict
+    ``analysis.write_result_json`` would have written for that job standalone, so
+    the Results tab can expand the bundle back into individual results with no
+    schema drift. ``"index"`` is a lightweight per-job summary so the bundle is
+    browsable without parsing every result.
+
+    The write is atomic (temp file + ``os.replace``) so the file is always valid
+    JSON even while the worker is rewriting it after each job — important since
+    the bundle is refreshed in place as a sweep progresses, and a reader (or a
+    crash) must never see a half-written file.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    mode = jobs[0].get("mode") if jobs else None
+    index = []
+    for j in jobs:
+        index.append({
+            "job_id": j.get("job_id"),
+            "label": j.get("label"),
+            "preset_name": j.get("preset_name"),
+            "seed_base": (j.get("params") or {}).get("seed_base"),
+            "status": j.get("status"),
+            "elapsed_s": j.get("elapsed_s"),
+            "error": bool(j.get("error")),
+        })
+
+    bundle = {
+        "kind": BATCH_RESULT_KIND,
+        "schema": 1,
+        "batch_id": batch_id,
+        "label": batch_label,
+        "mode": mode,
+        "created_at": _now_iso(),
+        "n_jobs": len(jobs),
+        "n_results": len(member_payloads),
+        "n_done": sum(1 for j in jobs if j.get("status") == "done"),
+        "n_error": sum(1 for j in jobs if j.get("status") == "error"),
+        "index": index,
+        "results": list(member_payloads),
+    }
+
+    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    tmp_path.write_text(json.dumps(bundle, indent=2))
+    os.replace(tmp_path, out_path)  # atomic on the same filesystem
+    return out_path
+
+
+def _make_progress_cb(control):
+    """Per-match progress callback for the background worker. Records progress
+    into the shared ``control`` dict (read by the UI) and BLOCKS while the run is
+    paused, so a pause takes effect between matches (serial runs) and at worst at
+    job boundaries (parallel runs). Never touches ``st.*`` — it runs off-thread."""
+    def cb(done, total):
+        # Block here while paused so the compute genuinely stops; still bail out
+        # promptly if a stop was requested while paused.
+        while control["pause"].is_set() and not control["stop"].is_set():
+            time.sleep(0.2)
+        control["job_done"] = done
+        control["job_total"] = total
+        control["queue_done_matches"] = control["completed_prior"] + done
+    return cb
+
+
+def _run_queue_worker(pending, results_dir, repo_path, control) -> None:
+    """Run a snapshot of pending jobs in a background thread.
+
+    Survives the Streamlit script run / websocket (so a sleeping screen no longer
+    interrupts a queue), and honors pause / stop via the Events in ``control``.
+    Writes results to disk through the normal ``run_job`` path; batch-sweep jobs
+    are folded into a single combined JSON that is refreshed in place after each
+    job (crash-resilient) rather than only at the end.
+
+    CRITICAL: this runs off the main thread, so it must NEVER call ``st.*`` or
+    touch ``st.session_state``. It communicates only through ``control`` (a plain
+    dict + threading.Events) and by mutating the job dicts it was handed.
+    """
+    cb = _make_progress_cb(control)
+    # Per-batch bookkeeping: a throwaway temp dir for run_job's individual
+    # writes, the collected member payloads, the jobs seen, and the stable
+    # combined-file path for this run.
+    tmp_dirs: dict[str, str] = {}
+    members: dict[str, list] = {}
+    jobs_by_batch: dict[str, list] = {}
+    paths: dict[str, Path] = {}
+    try:
+        for k, job in enumerate(pending):
+            if control["stop"].is_set():
+                break
+            # Pause at the job boundary too (covers parallel runs, where the
+            # callback may not be invoked while a job is mid-flight).
+            while control["pause"].is_set() and not control["stop"].is_set():
+                time.sleep(0.2)
+            if control["stop"].is_set():
+                break
+
+            control["job_idx"] = k
+            control["job_label"] = job.get("label", "")
+            control["job_done"] = 0
+            control["job_total"] = (job.get("params") or {}).get("matches") or 0
+
+            bid = job.get("batch_id")
+            if bid:
+                if bid not in tmp_dirs:
+                    tmp_dirs[bid] = tempfile.mkdtemp(prefix=f"sweep_{bid}_")
+                    members[bid] = []
+                    jobs_by_batch[bid] = []
+                    blabel = job.get("batch_label") or bid
+                    paths[bid] = _combined_batch_path(results_dir, bid, blabel)
+                jobs_by_batch[bid].append(job)
+                out_dir = tmp_dirs[bid]
+            else:
+                out_dir = results_dir
+
+            written = run_job(job, out_dir, progress_callback=cb,
+                              repo_path=repo_path)
+
+            if bid:
+                if written is not None:
+                    members[bid].append(written)
+                # Refresh the combined bundle in place after every job so partial
+                # progress is on disk even if the process dies mid-sweep.
+                _write_combined_batch_json(
+                    paths[bid], bid, job.get("batch_label") or bid,
+                    jobs_by_batch[bid], members[bid],
+                )
+                job["result_path"] = str(paths[bid])
+
+            control["completed_prior"] += control["job_total"]
+            control["queue_done_matches"] = control["completed_prior"]
+
+        # Drop the throwaway temp dirs and record one message per batch.
+        for bid in jobs_by_batch:
+            tmp = tmp_dirs.get(bid)
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+            control["messages"].append(
+                f"{paths[bid].name} ({len(members[bid])} result(s))"
+            )
+        control["state"] = "stopped" if control["stop"].is_set() else "done"
+    except Exception as exc:
+        control["error"] = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        control["state"] = "error"
+    finally:
+        control["finished_at"] = time.time()
+
+
+def _new_runner_control(pending) -> dict:
+    """Shared state for one background queue run. Lives in st.session_state and
+    is read by the UI each rerun; mutated by the worker thread."""
+    total = sum((j.get("params") or {}).get("matches") or 0 for j in pending)
+    return {
+        "state": "running",                 # running | done | stopped | error
+        "pause": threading.Event(),          # set => paused
+        "stop": threading.Event(),           # set => stop after current job
+        "started_at": time.time(),
+        "finished_at": None,
+        "n_pending": len(pending),
+        "job_idx": 0,
+        "job_label": "",
+        "job_done": 0,
+        "job_total": 0,
+        "completed_prior": 0,
+        "queue_total_matches": total,
+        "queue_done_matches": 0,
+        "messages": [],
+        "error": None,
+    }
+
 
 def _fmt_dur(seconds) -> str:
     if seconds is None or seconds < 0 or seconds != seconds:  # NaN guard
@@ -575,15 +822,124 @@ def _fmt_dur(seconds) -> str:
     return f"{h}h {m:02d}m"
 
 
+def _runner_display_state(control, alive) -> str:
+    """Human-facing status derived from the control flags."""
+    if control.get("state") == "error":
+        return "error"
+    if not alive and control.get("finished_at"):
+        return control.get("state") or "done"   # done | stopped | error
+    if control["stop"].is_set():
+        return "stopping"
+    if control["pause"].is_set():
+        return "paused"
+    return "running"
+
+
+def _render_runner_panel(control, alive) -> None:
+    """Render the background-run progress + Pause/Resume/Stop controls (while
+    running) or the final summary + Clear (once finished). Reads only the shared
+    ``control`` dict, so it's safe to call from the main script or a fragment."""
+    disp = _runner_display_state(control, alive)
+    icon = {"running": "▶", "paused": "⏸", "stopping": "⏹",
+            "done": "✓", "stopped": "■", "error": "✗"}.get(disp, "•")
+
+    q_total = max(control.get("queue_total_matches") or 0, 1)
+    q_done = min(control.get("queue_done_matches") or 0, q_total)
+    n_pending = control.get("n_pending") or 0
+    job_idx = control.get("job_idx") or 0
+    elapsed = (control.get("finished_at") or time.time()) - control["started_at"]
+
+    st.markdown(f"**Background run — {icon} {disp}**")
+    st.progress(
+        q_done / q_total,
+        text=(f"job {min(job_idx + 1, n_pending)}/{n_pending}  ·  "
+              f"{q_done}/{control.get('queue_total_matches') or 0} matches  ·  "
+              f"elapsed {_fmt_dur(elapsed)}"),
+    )
+    if alive and (control.get("job_total") or 0) > 0:
+        jd = control.get("job_done") or 0
+        jt = control.get("job_total") or 1
+        label = control.get("job_label") or ""
+        st.progress(min(jd / jt, 1.0),
+                    text=f"current: {label}  ·  match {jd}/{jt}")
+
+    if alive:
+        c1, c2 = st.columns(2)
+        if control["pause"].is_set():
+            if c1.button("▶ Resume", key="runner_resume",
+                         use_container_width=True):
+                control["pause"].clear()
+        else:
+            if c1.button("⏸ Pause", key="runner_pause",
+                         use_container_width=True,
+                         disabled=control["stop"].is_set()):
+                control["pause"].set()
+        if c2.button("⏹ Stop after current job", key="runner_stop",
+                     use_container_width=True, disabled=control["stop"].is_set()):
+            control["stop"].set()
+            control["pause"].clear()   # let an in-flight paused job finish & exit
+        if control["stop"].is_set():
+            st.caption("Stopping — finishing the current job, then halting. "
+                       "Jobs not yet started stay pending.")
+        elif control["pause"].is_set():
+            st.caption("Paused. The current job halts between matches; press "
+                       "Resume to continue. Closing the tab won't lose progress.")
+        else:
+            st.caption("Running in the background — safe to let the screen sleep "
+                       "or switch tabs. Results are written to disk as they "
+                       "complete.")
+    else:
+        if disp == "done":
+            st.success("Run finished.")
+        elif disp == "stopped":
+            st.warning("Run stopped. Jobs that hadn't started remain pending — "
+                       "press ▶ Run all pending to resume them.")
+        elif disp == "error":
+            st.error(f"Run failed: {(control.get('error') or {}).get('message')}")
+            tb = (control.get("error") or {}).get("traceback")
+            if tb:
+                st.code(tb, language="text")
+        if control.get("messages"):
+            st.info("Combined batch JSON written — "
+                    + "; ".join(control["messages"]) + ".")
+        if st.button("Clear run status", key="runner_clear"):
+            for _k in ("runner", "runner_thread", "_runner_finalized"):
+                st.session_state.pop(_k, None)
+            st.rerun()
+
+
+# Auto-refreshing wrapper: st.fragment(run_every=...) reruns ONLY this panel on a
+# timer, so live progress updates without rerunning the whole app (which would
+# blank out other tabs). Guarded for older Streamlit builds without fragments.
+if hasattr(st, "fragment"):
+    @st.fragment(run_every=0.8)
+    def _runner_panel_live():
+        control = st.session_state.get("runner")
+        thread = st.session_state.get("runner_thread")
+        if control is None:
+            return
+        alive = thread is not None and thread.is_alive()
+        _render_runner_panel(control, alive)
+        # On the running→finished transition, do ONE full-app rerun so the queue
+        # table (rendered outside this fragment) reflects the final statuses.
+        if not alive and not st.session_state.get("_runner_finalized"):
+            st.session_state["_runner_finalized"] = True
+            st.rerun()
+else:
+    _runner_panel_live = None
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
 st.title("Fullhouse Backtest Dashboard")
-st.caption("Drives `backtest.py` in-process. Sequential run queue, one JSON per run.")
+st.caption("Drives `backtest.py` in-process. Background run queue with "
+           "pause/stop; sweeps export a single combined JSON.")
 
-tab_setup, tab_run, tab_results = st.tabs(
-    ["1 · Bots & Presets", "2 · Configure & Queue", "3 · Results"]
+tab_setup, tab_run, tab_results, tab_profiler = st.tabs(
+    ["1 · Bots & Presets", "2 · Configure & Queue", "3 · Results",
+     "4 · D1 Profiler"]
 )
 
 
@@ -998,6 +1354,11 @@ with tab_run:
                 ):
                     added = 0
                     skipped_empty, skipped_big = [], []
+                    # One batch id for the whole sweep. Every job queued in this
+                    # click carries it so the runner folds their results into a
+                    # single combined JSON (instead of N separate files).
+                    batch_id = _new_job_id()
+                    batch_label = sweep_label_prefix.strip() or f"sweep_{batch_id}"
                     for pname in sweep_choices:
                         preset = next((p for p in presets if p["name"] == pname), None)
                         if not preset:
@@ -1037,11 +1398,14 @@ with tab_run:
                                     opponents=opps, preset_name=pname,
                                     params=job_params,
                                 )
+                            j["batch_id"] = batch_id
+                            j["batch_label"] = batch_label
                             st.session_state.queue.append(j)
                             added += 1
                     msg = (f"Queued {added} job(s) from sweep "
                            f"({len(sweep_choices)} preset × "
-                           f"{len(seed_list)} seed).")
+                           f"{len(seed_list)} seed) as batch `{batch_label}` "
+                           f"— results fold into one combined JSON on run.")
                     if skipped_empty:
                         msg += (" Skipped (no opponents found in pool): "
                                 + ", ".join(skipped_empty) + ".")
@@ -1076,6 +1440,7 @@ with tab_run:
                 ("opponents" if j["mode"] == "eval" else "field"):
                     ", ".join(o["id"] for o in j["opponents"]),
                 "preset": j["preset_name"] or "",
+                "batch": j.get("batch_label") or "",
                 "matches": j["params"]["matches"],
                 "hands": j["params"]["hands"],
                 "elapsed_s": j["elapsed_s"],
@@ -1083,96 +1448,62 @@ with tab_run:
             })
         st.dataframe(rows, use_container_width=True, hide_index=True)
 
+        # Is a background run already active? (It persists across reruns via
+        # session_state, so the queue keeps going even if the screen sleeps.)
+        _runner = st.session_state.get("runner")
+        _runner_thread = st.session_state.get("runner_thread")
+        running = (_runner is not None and _runner_thread is not None
+                   and _runner_thread.is_alive())
+
         qc1, qc2, qc3 = st.columns([1, 1, 1])
         pending_n = sum(1 for j in q if j["status"] == "pending")
         run_clicked = qc1.button(
             f"▶ Run all pending ({pending_n})",
             type="primary",
-            disabled=pending_n == 0,
+            disabled=pending_n == 0 or running,
             key="run_all",
         )
-        if qc2.button("Remove pending", key="clear_pending"):
+        if qc2.button("Remove pending", key="clear_pending", disabled=running):
             st.session_state.queue = [j for j in q if j["status"] != "pending"]
             st.rerun()
-        if qc3.button("Clear entire queue", key="clear_all"):
+        if qc3.button("Clear entire queue", key="clear_all", disabled=running):
             st.session_state.queue = []
             st.rerun()
 
-        if run_clicked:
+        if run_clicked and not running:
+            # Snapshot the pending jobs and run them in a BACKGROUND THREAD so the
+            # queue keeps going even if the screen sleeps or the tab disconnects.
+            # The worker writes results to disk and honors pause/stop via Events
+            # in the shared control dict; the UI below just polls that dict.
             pending = [j for j in q if j["status"] == "pending"]
-            queue_start = time.time()
-            total_matches = sum(j["params"]["matches"] for j in pending)
-            qstate = {"completed_prior": 0, "current_done": 0}
-
-            overall = st.progress(
-                0.0,
-                text=(f"0/{len(pending)} jobs  ·  "
-                      f"0/{total_matches} matches  ·  elapsed 0s"),
+            control = _new_runner_control(pending)
+            repo_path = (st.session_state.get("repo_path") or "").strip() or None
+            results_dir = st.session_state.results_dir
+            thread = threading.Thread(
+                target=_run_queue_worker,
+                args=(pending, results_dir, repo_path, control),
+                name="queue-worker",
+                daemon=True,
             )
-
-            for k, job in enumerate(pending):
-                qstate["current_done"] = 0
-                with st.status(f"Running: {job['label']}", expanded=True) as status:
-                    inner = st.progress(0.0)
-                    info = st.empty()
-                    start = time.time()
-
-                    def _cb(done, total,
-                            _info=info, _inner=inner, _start=start,
-                            _qstart=queue_start, _qstate=qstate,
-                            _total_matches=total_matches,
-                            _job_idx=k, _n_jobs=len(pending),
-                            _overall=overall):
-                        now = time.time()
-                        job_elapsed = now - _start
-                        job_rate = done / max(job_elapsed, 1e-9)
-                        job_eta = ((total - done) / job_rate) if job_rate > 0 else None
-                        _inner.progress(
-                            done / total,
-                            text=(f"match {done}/{total}  ·  "
-                                  f"elapsed {_fmt_dur(job_elapsed)}  ·  "
-                                  f"ETA {_fmt_dur(job_eta)}"),
-                        )
-                        _info.caption(f"{job_rate:.2f} matches/s")
-                        _qstate["current_done"] = done
-                        global_done = _qstate["completed_prior"] + done
-                        q_elapsed = now - _qstart
-                        q_rate = global_done / max(q_elapsed, 1e-9)
-                        q_remaining = max(_total_matches - global_done, 0)
-                        q_eta = (q_remaining / q_rate) if q_rate > 0 else None
-                        _overall.progress(
-                            global_done / max(_total_matches, 1),
-                            text=(f"job {_job_idx+1}/{_n_jobs}  ·  "
-                                  f"{global_done}/{_total_matches} matches  ·  "
-                                  f"elapsed {_fmt_dur(q_elapsed)}  ·  "
-                                  f"ETA {_fmt_dur(q_eta)}"),
-                        )
-
-                    run_job(job, st.session_state.results_dir, progress_callback=_cb)
-
-                    qstate["completed_prior"] += qstate["current_done"]
-
-                    if job["status"] == "done":
-                        status.update(
-                            label=(f"✓ {job['label']}  "
-                                   f"({_fmt_dur(job['elapsed_s'])}, result: "
-                                   f"{Path(job['result_path']).name})"),
-                            state="complete",
-                        )
-                    else:
-                        status.update(
-                            label=f"✗ {job['label']} — {job['error']['message']}",
-                            state="error",
-                        )
-
-            total_queue_elapsed = time.time() - queue_start
-            overall.progress(
-                1.0,
-                text=(f"{len(pending)}/{len(pending)} jobs  ·  "
-                      f"elapsed {_fmt_dur(total_queue_elapsed)}"),
-            )
-            st.success(f"Queue finished in {_fmt_dur(total_queue_elapsed)}.")
+            st.session_state["runner"] = control
+            st.session_state["runner_thread"] = thread
+            st.session_state.pop("_runner_finalized", None)
+            thread.start()
             st.rerun()
+
+        # Live progress + Pause/Resume/Stop (or the final summary once finished).
+        if st.session_state.get("runner") is not None:
+            st.markdown("---")
+            rt = st.session_state.get("runner_thread")
+            alive = rt is not None and rt.is_alive()
+            if alive and _runner_panel_live is not None:
+                _runner_panel_live()          # auto-refreshes via st.fragment
+            else:
+                _render_runner_panel(st.session_state["runner"], alive)
+                if alive:
+                    # No fragment support on this Streamlit build: refresh by hand.
+                    if st.button("↻ Refresh status", key="refresh_runner"):
+                        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -1611,6 +1942,53 @@ def _render_comparison_matrix(all_results):
                "guards the multiple comparisons shown here.")
 
 
+def _load_result_payloads(files):
+    """Read result files into a flat list of per-result payloads.
+
+    A normal result file contributes one payload. A combined batch bundle
+    (``kind == BATCH_RESULT_KIND``) is expanded into one payload per member
+    result, so the rest of the Results tab never has to know batches exist.
+    Unreadable files surface as a payload with ``raw=None`` and a
+    ``parse_error`` string.
+
+    Each payload is a dict with keys: ``label`` (display string), ``raw`` (the
+    result dict or None), ``mtime``, ``src`` (the Path on disk), ``member_index``
+    (int for a bundle member, else None), ``batch_label``, and ``parse_error``.
+    """
+    payloads = []
+    for f in files:
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        try:
+            raw = json.loads(f.read_text())
+        except Exception as exc:
+            payloads.append({"label": f.name, "raw": None, "mtime": mtime,
+                             "src": f, "member_index": None,
+                             "batch_label": None, "parse_error": str(exc)})
+            continue
+        if isinstance(raw, dict) and raw.get("kind") == BATCH_RESULT_KIND:
+            blabel = raw.get("label") or raw.get("batch_id") or f.stem
+            members = raw.get("results") or []
+            if not members:
+                payloads.append({"label": f"{f.name} · {blabel} (empty)",
+                                 "raw": None, "mtime": mtime, "src": f,
+                                 "member_index": None, "batch_label": blabel,
+                                 "parse_error": "batch bundle has no results"})
+                continue
+            for i, m in enumerate(members):
+                payloads.append({"label": f"{f.name} · {blabel} #{i + 1}",
+                                 "raw": m, "mtime": mtime, "src": f,
+                                 "member_index": i, "batch_label": blabel,
+                                 "parse_error": None})
+        else:
+            payloads.append({"label": f.name, "raw": raw, "mtime": mtime,
+                             "src": f, "member_index": None,
+                             "batch_label": None, "parse_error": None})
+    return payloads
+
+
 with tab_results:
     st.subheader("Results")
     results_dir = Path(st.session_state.results_dir)
@@ -1619,12 +1997,31 @@ with tab_results:
     if not files:
         st.info(f"No result files in `{results_dir}` yet.")
     else:
-        st.caption(f"{len(files)} result file(s) in `{results_dir}`")
+        # Flatten any combined batch bundles (kind="batch_sweep") so the index,
+        # matrix, and inspector all operate on individual results. A normal file
+        # yields one payload; a bundle yields one payload per member result.
+        payloads = _load_result_payloads(files)
+        n_results = sum(1 for p in payloads if p["raw"] is not None)
+        batch_files = {p["src"] for p in payloads if p["member_index"] is not None}
+        cap = (f"{len(files)} result file(s) in `{results_dir}` · "
+               f"{n_results} result(s)")
+        if batch_files:
+            cap += f" · {len(batch_files)} batch bundle(s) expanded"
+        st.caption(cap)
 
         index_rows = []
-        for f in files:
+        for p in payloads:
+            if p["raw"] is None:
+                index_rows.append({
+                    "file": p["label"], "batch": p.get("batch_label") or "",
+                    "mode": "?", "completed_at": None,
+                    "label": f"(unreadable: {p['parse_error']})", "hero(es)": None,
+                    "opponents": None, "preset": "", "matches": None,
+                    "hands": None, "headline": "", "elapsed_s": None, "error": True,
+                })
+                continue
             try:
-                d = analysis.normalize_result(json.loads(f.read_text()))
+                d = analysis.normalize_result(p["raw"])
                 mode = d.get("mode") or (d.get("metadata") or {}).get("mode") or "eval"
                 if mode == "eval":
                     hero_repr = (d.get("hero") or {}).get("id") or ""
@@ -1654,7 +2051,8 @@ with tab_results:
                     t = d.get("t_stat")
                     headline = (f"t={t:+.2f}" if isinstance(t, (int, float)) else None)
                 index_rows.append({
-                    "file": f.name,
+                    "file": p["label"],
+                    "batch": p.get("batch_label") or "",
                     "mode": mode,
                     "legacy": d.get("_legacy") or "",
                     "completed_at": (d.get("metadata") or {}).get("completed_at"),
@@ -1670,7 +2068,8 @@ with tab_results:
                 })
             except Exception as exc:
                 index_rows.append({
-                    "file": f.name, "mode": "?", "completed_at": None,
+                    "file": p["label"], "batch": p.get("batch_label") or "",
+                    "mode": "?", "completed_at": None,
                     "label": f"(unreadable: {exc})", "hero(es)": None,
                     "opponents": None, "preset": "", "matches": None,
                     "hands": None, "headline": "", "elapsed_s": None, "error": True,
@@ -1684,24 +2083,29 @@ with tab_results:
         st.markdown("---")
         st.markdown("### Hero × preset matrix")
         _all_results = []
-        for f in files:
+        for p in payloads:
+            if p["raw"] is None:
+                continue
             try:
-                _all_results.append(analysis.normalize_result(json.loads(f.read_text())))
+                _all_results.append(analysis.normalize_result(p["raw"]))
             except Exception:
                 continue
         _render_comparison_matrix(_all_results)
 
         st.markdown("---")
         st.markdown("**Inspect one result**")
-        selected_name = st.selectbox(
-            "Result file", options=[f.name for f in files], key="result_select",
+        selectable = [p for p in payloads if p["raw"] is not None]
+        sel_label = st.selectbox(
+            "Result",
+            options=[p["label"] for p in selectable] or ["(none)"],
+            key="result_select",
         )
-        selected = next((f for f in files if f.name == selected_name), None)
-        if selected:
+        sel = next((p for p in selectable if p["label"] == sel_label), None)
+        if sel:
             try:
-                data = analysis.normalize_result(json.loads(selected.read_text()))
+                data = analysis.normalize_result(sel["raw"])
             except Exception as exc:
-                st.error(f"Could not parse {selected.name}: {exc}")
+                st.error(f"Could not parse {sel['label']}: {exc}")
                 data = None
 
             if data:
@@ -1725,12 +2129,15 @@ with tab_results:
                     meta_payload["hero_b"] = data.get("hero_b")
                     meta_payload["t_stat"] = data.get("t_stat")
                 meta_col.json(meta_payload)
+                _dl_bytes = json.dumps(sel["raw"], indent=2).encode("utf-8")
+                _dl_name = (sel["src"].name if sel["member_index"] is None
+                            else f"{sel['src'].stem}_{sel['member_index'] + 1}.json")
                 dl_col.download_button(
                     "⤓ Download JSON",
-                    data=selected.read_bytes(),
-                    file_name=selected.name,
+                    data=_dl_bytes,
+                    file_name=_dl_name,
                     mime="application/json",
-                    key=f"dl_{selected.name}",
+                    key=f"dl_{sel_label}",
                 )
 
                 if data.get("error"):
@@ -1896,7 +2303,7 @@ with tab_results:
                                 "Series to histogram",
                                 options=opts,
                                 index=min(default_idx, len(opts) - 1) if opts else 0,
-                                key=f"hist_series_{selected.name}",
+                                key=f"hist_series_{sel_label}",
                             )
                             if choice.endswith("(paired)"):
                                 hid = choice.split(" − ", 1)[0]
@@ -1933,3 +2340,177 @@ with tab_results:
                             plt.close(fig)
                         else:
                             st.caption("No per-match deltas in this result.")
+
+
+# ---------------------------------------------------------------------------
+# Tab 4 — D1 Profiler: exploitability stats + range calibration from the
+# downloadable D1 hand-history JSON. All parsing / stats / calibration live in
+# d1_profiler.py (pure, stdlib-only, streamlit-free); everything here is the
+# upload plumbing + rendering. The histories it reads are a SEPARATE artifact
+# from the backtest result JSONs the run queue produces.
+# ---------------------------------------------------------------------------
+
+with tab_profiler:
+    st.subheader("D1 Field Profiler & Range Calibrator")
+    if not _HAS_PROFILER:
+        st.error(
+            "`d1_profiler.py` couldn't be imported, so this tab is disabled.\n\n"
+            f"`{type(_PROFILER_IMPORT_ERR).__name__}: {_PROFILER_IMPORT_ERR}`\n\n"
+            "Fix: place `d1_profiler.py` next to `app.py`."
+        )
+    else:
+        st.caption(
+            "Turns downloadable D1 hand histories into a per-opponent "
+            "exploitability profile and showdown-calibrated range strings for "
+            "`_RANGE_STRINGS`. These histories are separate from the backtest "
+            "results in tab 3 — upload them below."
+        )
+
+        hdir = st.session_state.histories_dir
+        Path(hdir).mkdir(parents=True, exist_ok=True)
+        files_in = sorted(Path(hdir).glob("*.json"))
+        has_files = bool(files_in)
+
+        st.markdown(f"**Histories** — `{hdir}` ({len(files_in)} JSON file(s))")
+        up = st.file_uploader(
+            "Add D1 hand-history JSON (saved into the histories dir)",
+            type=["json"], accept_multiple_files=True, key="profiler_upload",
+        )
+        if up:
+            if st.button(f"Save {len(up)} uploaded file(s)", key="profiler_save"):
+                saved = 0
+                for f in up:
+                    try:
+                        (Path(hdir) / f.name).write_bytes(f.getvalue())
+                        saved += 1
+                    except Exception as exc:
+                        st.error(f"Couldn't save {f.name}: {exc}")
+                if saved:
+                    st.success(f"Saved {saved} file(s) to `{hdir}`.")
+                    st.rerun()
+
+        if not has_files:
+            st.info("No hand-history JSON in the histories dir yet. Upload some "
+                    "above (or drop files into the dir) to enable profiling.")
+
+        # ----- Sniff schema -----
+        with st.expander("Sniff schema (inspect an unknown JSON layout)"):
+            st.caption(
+                "Run this first on a new D1 export. The downloadable format isn't "
+                "documented, so the profiler maps fields via a KEYMAP with "
+                "fallbacks. If any field shows `<MISSING>`, add the real key to "
+                "`KEYMAP` in `d1_profiler.py` and re-run — that block is the only "
+                "thing meant to be edited."
+            )
+            if st.button("Sniff first file", key="profiler_sniff",
+                         disabled=not has_files):
+                try:
+                    st.code(d1_profiler.sniff_report(hdir), language="text")
+                except Exception as exc:
+                    st.error(f"Sniff failed: {exc}")
+
+        # ----- Profile opponents -----
+        with st.expander("Profile opponents (exploitability stats)",
+                         expanded=has_files):
+            if st.button("Profile field", key="profiler_profile",
+                         disabled=not has_files, type="primary"):
+                try:
+                    nhands, agg = d1_profiler.profile(hdir)
+                except Exception as exc:
+                    st.error(f"Profile failed: {exc}")
+                    nhands, agg = 0, {}
+                if not agg:
+                    st.warning(
+                        "No hands parsed. The default KEYMAP may not match this "
+                        "export — use **Sniff schema** above and adjust KEYMAP."
+                    )
+                else:
+                    rows = d1_profiler.compute_profile_rows(agg)
+
+                    def _pct(x):
+                        return None if x is None else round(100 * x, 1)
+
+                    table = [{
+                        "opponent": r["opponent"],
+                        "hands": r["hands"],
+                        "VPIP%": _pct(r["vpip"]),
+                        "PFR%": _pct(r["pfr"]),
+                        "3bet%": _pct(r["threebet"]),
+                        "fold→cbet%": _pct(r["fold_to_cbet"]),
+                        "raise/bet%": _pct(r["raise_vs_bet"]),
+                        "aggr%": _pct(r["aggr"]),
+                        "exploit flags": ", ".join(r["flags"]),
+                    } for r in rows]
+                    st.caption(f"Profiled {nhands} hands · {len(agg)} opponents. "
+                               "Blank cells mean too small a denominator to rate.")
+                    st.dataframe(table, use_container_width=True, hide_index=True)
+                    st.caption(
+                        "Lever guidance: many **CBET-bluffable** & few "
+                        "CHECK-RAISER ⇒ the c-bet is worth patching; many "
+                        "**OVER-AGGRESSIVE** ⇒ widen aggressor ranges; mostly no "
+                        "flags ⇒ the field is competent, don't patch."
+                    )
+
+        # ----- Calibrate ranges -----
+        with st.expander("Calibrate ranges (range strings from showdowns)"):
+            rc1, rc2 = st.columns([2, 1])
+            hero = rc1.text_input(
+                "Exclude hero seat id (optional)", key="profiler_hero",
+                placeholder="e.g. v7-m2 — blank = whole field",
+                help="Excludes your own showdowns so the calibrated range "
+                     "reflects the field, not you.",
+            )
+            min_combos = rc2.number_input(
+                "Min showdowns / bucket", min_value=1, max_value=500, value=8,
+                step=1, key="profiler_mincombos",
+                help="Buckets with fewer showdowns than this are reported but not "
+                     "turned into a range string (too thin to trust).",
+            )
+            if st.button("Calibrate from showdowns", key="profiler_ranges",
+                         disabled=not has_files):
+                try:
+                    buckets = d1_profiler.calibrate_ranges(
+                        hdir, hero=(hero.strip() or None),
+                        min_combos=int(min_combos),
+                    )
+                except Exception as exc:
+                    st.error(f"Calibration failed: {exc}")
+                    buckets = {}
+                ordered = d1_profiler.order_range_buckets(buckets)
+                if not ordered:
+                    st.warning(
+                        "No showdown holdings found to calibrate. Showdowns only "
+                        "appear for hands that reached showdown; an export with "
+                        "no revealed holdings yields nothing here."
+                    )
+                else:
+                    export_lines = ["_RANGE_STRINGS = {"]
+                    for b in ordered:
+                        head = f"**{b['display_name']}** — n={b['n']} showdowns"
+                        if b["range_str"] is not None:
+                            head += f", {b['n_classes']} classes"
+                        st.markdown(head)
+                        if b["range_str"] is None:
+                            st.caption(f"Too few showdowns to trust ({b['n']}); "
+                                       "keep the eyeballed string.")
+                        else:
+                            st.code(f'"{b["tag"]}": "{b["range_str"]}",',
+                                    language="python")
+                            export_lines.append(
+                                f'    "{b["tag"]}": "{b["range_str"]}",')
+                    export_lines.append("}")
+                    st.caption(
+                        "Showdown-revealed = the made-hand / value part of each "
+                        "line; it under-counts bluffs and give-ups, so these "
+                        "widths are a LOWER BOUND. Widen the bluff-heavy buckets "
+                        "(OPEN / THREEBET) with judgment, using the PFR / aggr "
+                        "rates from the profile above as a guide."
+                    )
+                    if len(export_lines) > 2:   # at least one real range emitted
+                        st.download_button(
+                            "⤓ Download _RANGE_STRINGS snippet",
+                            data="\n".join(export_lines).encode("utf-8"),
+                            file_name="range_strings.py",
+                            mime="text/x-python",
+                            key="profiler_dl_ranges",
+                        )

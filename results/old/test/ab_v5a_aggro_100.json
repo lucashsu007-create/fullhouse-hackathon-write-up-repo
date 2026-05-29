@@ -1,0 +1,42 @@
+{
+  "a": "A:v5a_antiperma",
+  "b": "B:v4_1_classifier_retuned",
+  "elapsed_s": 402.59,
+  "A": {
+    "matches": 100,
+    "total_delta": 656617,
+    "mean_delta": 6566.17,
+    "stdev": 19289.86525135032,
+    "stderr": 1928.9865251350318,
+    "ci95": 3780.8135892646624,
+    "ci_low": 2785.3564107353377,
+    "ci_high": 10346.983589264662,
+    "bb_per_100": 16.415425,
+    "win_rate": 0.48
+  },
+  "B": {
+    "matches": 100,
+    "total_delta": 656867,
+    "mean_delta": 6568.67,
+    "stdev": 19293.282713936966,
+    "stderr": 1929.3282713936965,
+    "ci95": 3781.483411931645,
+    "ci_low": 2787.186588068355,
+    "ci_high": 10350.153411931646,
+    "bb_per_100": 16.421675,
+    "win_rate": 0.48
+  },
+  "A_minus_B": {
+    "matches": 100,
+    "total_delta": -250,
+    "mean_delta": -2.5,
+    "stdev": 25.0,
+    "stderr": 2.5,
+    "ci95": 4.9,
+    "ci_low": -7.4,
+    "ci_high": 2.4000000000000004,
+    "bb_per_100": -0.00625,
+    "win_rate": 0.0
+  },
+  "t_stat": -1.0
+}

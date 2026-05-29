@@ -1,0 +1,70 @@
+{
+  "schema_version": 3,
+  "metadata": {
+    "job_id": "20260529T080656_c933d2",
+    "label": "v11.4 test \u00b7 broad_mix \u00b7 s2",
+    "mode": "ab",
+    "created_at": "2026-05-29T08:06:56Z",
+    "started_at": "2026-05-29T08:07:01Z",
+    "completed_at": "2026-05-29T08:07:01Z"
+  },
+  "mode": "ab",
+  "opponents": [
+    {
+      "id": "calling_station",
+      "path": "/home/lucas/projects/fullhouse-hackathon-write-up-repo/bots/custom/calling_station/bot.py"
+    },
+    {
+      "id": "nit_folder",
+      "path": "/home/lucas/projects/fullhouse-hackathon-write-up-repo/bots/custom/nit_folder/bot.py"
+    },
+    {
+      "id": "multi_barrel",
+      "path": "/home/lucas/projects/fullhouse-hackathon-write-up-repo/bots/custom/multi_barrel/bot.py"
+    },
+    {
+      "id": "gto_balanced",
+      "path": "/home/lucas/projects/fullhouse-hackathon-write-up-repo/bots/custom/gto_balanced/bot.py"
+    },
+    {
+      "id": "min_ball",
+      "path": "/home/lucas/projects/fullhouse-hackathon-write-up-repo/bots/custom/min_ball/bot.py"
+    }
+  ],
+  "preset_name": "broad_mix",
+  "params": {
+    "matches": 100,
+    "hands": 1000,
+    "seed_base": 2,
+    "budget": 2.0,
+    "fold_on_timeout": true,
+    "workers": 21,
+    "big_blind": 100,
+    "starting_stack": 10000
+  },
+  "elapsed_s": null,
+  "stats": null,
+  "per_match_deltas": null,
+  "per_match_ev_deltas": null,
+  "per_match_placement": null,
+  "errors_per_bot": null,
+  "timing_per_bot": null,
+  "error": {
+    "type": "FileNotFoundError",
+    "message": "[Errno 2] No such file or directory: '/mnt/user-data/uploads/v11_exploit.py'",
+    "traceback": "concurrent.futures.process._RemoteTraceback: \n\"\"\"\nTraceback (most recent call last):\n  File \"/usr/lib/python3.12/concurrent/futures/process.py\", line 263, in _process_worker\n    r = call_item.fn(*call_item.args, **call_item.kwargs)\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/lucas/projects/fullhouse-hackathon-write-up-repo/analysis.py\", line 203, in _multi_round_worker\n    dm = build_decide_map({b: paths[b] for b in order})\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/lucas/projects/fullhouse-hackathon-write-up-repo/backtest.py\", line 173, in build_decide_map\n    return {bid: load_decide(p) for bid, p in id_to_path.items()}\n                 ^^^^^^^^^^^^^^\n  File \"/home/lucas/projects/fullhouse-hackathon-write-up-repo/backtest.py\", line 137, in load_decide\n    spec.loader.exec_module(mod)\n  File \"<frozen importlib._bootstrap_external>\", line 995, in exec_module\n  File \"<frozen importlib._bootstrap>\", line 488, in _call_with_frames_removed\n  File \"/home/lucas/projects/fullhouse-hackathon-write-up-repo/hero_bots/v11_exploit_diff_v4/bot.py\", line 5, in <module>\n    ORIG=load(\"o\",\"/mnt/user-data/uploads/v11_exploit.py\")\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/lucas/projects/fullhouse-hackathon-write-up-repo/hero_bots/v11_exploit_diff_v4/bot.py\", line 4, in load\n    sys.modules[n]=m; s.loader.exec_module(m); return m\n                      ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<frozen importlib._bootstrap_external>\", line 991, in exec_module\n  File \"<frozen importlib._bootstrap_external>\", line 1128, in get_code\n  File \"<frozen importlib._bootstrap_external>\", line 1186, in get_data\nFileNotFoundError: [Errno 2] No such file or directory: '/mnt/user-data/uploads/v11_exploit.py'\n\"\"\"\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/home/lucas/projects/fullhouse-hackathon-write-up-repo/app.py\", line 530, in run_job\n    result = analysis._run_multi(\n             ^^^^^^^^^^^^^^^^^^^^\n  File \"/home/lucas/projects/fullhouse-hackathon-write-up-repo/analysis.py\", line 392, in _run_multi\n    i, round_results = fut.result()\n                       ^^^^^^^^^^^^\n  File \"/usr/lib/python3.12/concurrent/futures/_base.py\", line 449, in result\n    return self.__get_result()\n           ^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.12/concurrent/futures/_base.py\", line 401, in __get_result\n    raise self._exception\nFileNotFoundError: [Errno 2] No such file or directory: '/mnt/user-data/uploads/v11_exploit.py'\n"
+  },
+  "heroes": [
+    {
+      "id": "v11_exploit_diff_v4",
+      "path": "/home/lucas/projects/fullhouse-hackathon-write-up-repo/hero_bots/v11_exploit_diff_v4/bot.py"
+    },
+    {
+      "id": "v7_m2",
+      "path": "/home/lucas/projects/fullhouse-hackathon-write-up-repo/hero_bots/v7_m2/bot.py"
+    }
+  ],
+  "baseline": "v7_m2",
+  "vs_baseline": null,
+  "per_match_paired": null
+}

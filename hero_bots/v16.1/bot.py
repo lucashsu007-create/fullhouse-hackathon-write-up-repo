@@ -1,10 +1,43 @@
 # ============================================================
-# VARIANT: v7_m2
-# CHANGE:  Marginal cutoff 0.38 -> 0.42 (tighten marginal-call threshold)
-# HYPOTHESIS: v7 calls too many marginal showdowns under deflated equity; tightening folds more. Helps vs tight; risks vs aggressive.
-# DIFF FROM v7: single-line cutoff change in _postflop_by_equity
-#   (if eq >= 0.38:  ->  if eq >= 0.42:)
-#   + BOT_NAME change. Everything else byte-identical to v7.
+# VARIANT: v16  (== this chat's "v8" foundation, relabeled per request)
+# PURPOSE: Isolation arm for the "was the code the bottleneck?" question. This
+#          is NOT a re-attempt of the README's rejected V8-V15 strategy
+#          OVERLAYS (read-driven exploits / balance / conditional overrides).
+#          It is the corrected v7_m2 FOUNDATION: the eight fixes below, of which
+#          the load-bearing one is the equity-denominator bug (#2) the README's
+#          evaluations predate. To answer the hypothesis, A/B this against
+#          V7-M2(fix) on the real backtester (floor rule, watch barrel for #4).
+#          EV-UNTESTED here: synthetic correctness/scope only; eval7 ran but no
+#          chip-EV pass. Does NOT inherit V7-M2(fix)'s +28.8 / +17.9 numbers.
+# ============================================================
+# VARIANT: v8  (built on v7_m2 — keeps the 0.42 marginal cutoff)
+# CHANGE:  Close the eight range-/strategy-model leaks flagged in review. The
+#          equity ENGINE was already range-aware; the leaks were that the range
+#          MODEL fed into it was looser and less board/position-aware than the
+#          engine's sophistication implied, plus a few sizing/safety gaps.
+#
+# DIFF FROM v7_m2:
+#   #2 equity denominator: _equity_vs_multi_range counted failed (card-conflict
+#      / dead) trials in the denominator, deflating equity in tight/multiway
+#      spots. Now separates attempts (budget) from trials (successful sims).
+#   #1 board-aware postflop ranges: villains who CONTINUE postflop are now
+#      intersected with a board-connection filter; pure air is dropped.
+#   #6 passive-rocket postflop: a confirmed-passive villain who RAISES postflop
+#      is modeled as genuinely strong made hands / big draws on THIS board
+#      (two-pair+, sets, overpairs, combo draws) built from their wide preflop
+#      range — so low sets / two pair (88, T9s ...) are included, not just JJ+/AK.
+#   #5 position-split opener ranges: OPEN_EARLY/MIDDLE/LATE (~7/14/25%) replace
+#      the single flat ~22% OPEN, keyed by the opener's seat.
+#   #3 cold-4bet defense: facing an open + a 3-bet (raises>=2, we weren't the
+#      first raiser) now uses a tight cold-4bet-or-fold/flat branch instead of
+#      the open-defense table.
+#   #4 postflop value raises: 0.72-0.85 equity facing a bet now raises for thin
+#      value (frequency- and board-texture-dependent) instead of only calling.
+#   #7 _is_facing_jam: based on stack/owed and live all-in state, not a stale
+#      "any all_in in the last 8 log entries" scan that false-positived.
+#   #8 _sanitize: an illegal check while facing a bet now folds (was: blind
+#      call), so an upstream bug can't turn into an expensive station-call.
+#   + BOT_NAME change. Everything else identical to v7_m2.
 # ============================================================
 """
 ================================================================================
@@ -69,7 +102,7 @@ except Exception:                              # pragma: no cover
     eval7 = None
     _HAVE_EVAL7 = False
 
-BOT_NAME = "v14-trap"
+BOT_NAME = "v16"
 BOT_AVATAR = "robot_1"
 
 _RANKS = "23456789TJQKA"
@@ -509,6 +542,16 @@ _RANGE_STRINGS = {
     "OPEN":
         "22+, A2s+, K9s+, Q9s+, J9s+, T9s, 98s, 87s, 76s, 65s, 54s, "
         "A9o+, KTo+, QTo+, JTo",
+    # Position-split opener ranges (v8 leak #5). Modeling every preflop open as
+    # the single ~22% "OPEN" range above over-credits early position with a wide
+    # range and under-credits late position. These tiers (~7% / ~14% / ~25% of
+    # all hands) are selected by the opener's seat via _OPENER_TIER.
+    "OPEN_EARLY":
+        "66+, ATs+, KQs, AQo+",
+    "OPEN_MIDDLE":
+        "44+, A7s+, KTs+, QTs+, JTs, T9s, ATo+, KQo",
+    "OPEN_LATE":
+        "22+, A2s+, K7s+, Q8s+, J8s+, T8s+, 97s+, A8o+, KTo+, QTo+, JTo",
     # 3-bet range: ~7% — value (JJ+, AQ+) plus suited-Ace bluffs.
     "THREEBET":
         "JJ+, AQs+, AKo, A5s, A4s, KQs",
@@ -556,7 +599,8 @@ def _villain_action_summary(state, villain_seat):
     Defensive — any malformed log returns sensible defaults."""
     info = {"acted": False, "voluntary_pre": False, "raised_pre": False,
             "threebet_pre": False, "four_bet_pre": False,
-            "raised_postflop": False, "posted_blind_only": True}
+            "raised_postflop": False, "continued_postflop": False,
+            "posted_blind_only": True}
     try:
         recon = _reconstruct_hand(state.get("action_log") or [])
     except Exception:
@@ -584,51 +628,109 @@ def _villain_action_summary(state, villain_seat):
         else:
             if act in ("raise", "all_in"):
                 info["raised_postflop"] = True
+            if act in ("call", "raise", "all_in"):
+                info["continued_postflop"] = True
     return info
 
 
-def _range_for_villain(state, villain_seat, villain_bot_id):
-    """Decide which range bucket fits this villain's action history this hand.
-    Returns one of WIDE / OPEN / THREEBET / NUTTED / UNKNOWN.
+def _open_tier_str(state, villain_seat):
+    """Position-tiered opener range string for a villain who open-raised
+    (v8 leak #5). Falls back to OPEN_MIDDLE if we can't read their seat."""
+    pos = _seat_positions(state).get(villain_seat)
+    tier = _OPENER_TIER.get(pos, "MIDDLE")
+    if tier == "EARLY":
+        return "OPEN_EARLY"
+    if tier == "LATE":
+        return "OPEN_LATE"
+    return "OPEN_MIDDLE"
 
-    Priority order:
-      1. Passive-rocket override: confirmed passive villain who has raised
-         or jammed this hand -> NUTTED.
-      2. 4-bet or higher          -> NUTTED.
-      3. 3-bet                    -> THREEBET.
-      4. Open-raised preflop      -> OPEN.
-      5. Called preflop / limped  -> WIDE.
-      6. Hasn't voluntarily acted -> UNKNOWN (random fallback).
+
+def _range_and_filter_for_villain(state, villain_seat, villain_bot_id):
+    """Decide (range_str, filter_mode) for this villain's action this hand.
+
+    range_str  : key into _HANDRANGES (WIDE / OPEN_* / THREEBET / NUTTED), or
+                 'UNKNOWN' for uniform random sampling.
+    filter_mode: how the equity engine should intersect that range with the
+                 CURRENT board —
+                   'none'    : no board filter (preflop, or villain hasn't
+                               continued postflop).
+                   'connect' : villain CONTINUED postflop (called/raised), so
+                               drop pure air (leak #1) — keep pairs+, draws,
+                               overcards.
+                   'strong'  : a confirmed-PASSIVE villain put in a postflop
+                               RAISE (leak #6). Respect it as genuinely strong:
+                               two-pair+, sets, overpairs, made flushes/straights
+                               or big combo draws on THIS board. Applied to their
+                               WIDE/OPEN preflop range (not a narrow JJ+/AK one),
+                               so low sets / two pair (88, T9s, 98s, ...) survive.
+
+    Priority:
+      A. confirmed-passive + raised postflop -> (preflop range, 'strong')
+      B. any other villain raised postflop   -> (THREEBET, 'connect')
+      C. confirmed-passive + raised PREFLOP, no board yet -> (NUTTED, 'none')
+      D. preflop ladder (4bet/3bet/open), board-connect if they continued
+      E. limped/called, board-connect if they continued
+      F. hasn't voluntarily acted -> (UNKNOWN, 'none')
     """
     info = _villain_action_summary(state, villain_seat)
     stats = PLAYER_STATS.get(villain_bot_id)
+    board_present = len(state.get("community_cards", []) or []) >= 3
+    passive = _villain_is_passive(stats)
 
-    # (1) Passive-rocket override. Only fires when the villain actually
-    # showed aggression this hand AND their lifetime stats look passive.
-    showed_aggression = (info["raised_pre"] or info["threebet_pre"]
-                         or info["four_bet_pre"] or info["raised_postflop"])
-    if showed_aggression and _villain_is_passive(stats):
-        return "NUTTED"
-
-    # (2) (3) (4) preflop action ladder.
+    # Preflop-only bucket = their range entering the flop.
     if info["four_bet_pre"]:
-        return "NUTTED"
+        pre_bucket = "NUTTED"
+    elif info["threebet_pre"]:
+        pre_bucket = "THREEBET"
+    elif info["raised_pre"]:
+        pre_bucket = _open_tier_str(state, villain_seat)
+    elif info["voluntary_pre"]:
+        pre_bucket = "WIDE"
+    else:
+        pre_bucket = "UNKNOWN"
+
+    # (A) Confirmed-passive villain who RAISED postflop: a rock putting in a
+    # raise is genuinely strong. Filter their (wide) preflop range to strong
+    # made hands / big draws on this board. UNKNOWN preflop -> WIDE proxy
+    # (a checking BB that suddenly check-raises still had a wide pre-range).
+    if board_present and info["raised_postflop"] and passive:
+        base = pre_bucket if pre_bucket != "UNKNOWN" else "WIDE"
+        return base, "strong"
+
+    # (B) Any other postflop raise (incl. non-passive / unknown read): a
+    # value-leaning, board-connected range. We do NOT use the 'strong' filter
+    # here, so we don't over-respect an aggressive player's semibluffs.
+    if board_present and info["raised_postflop"]:
+        return "THREEBET", "connect"
+
+    # (C) Passive-rocket override on a PREFLOP raise, before any board.
+    showed_pre_aggression = (info["raised_pre"] or info["threebet_pre"]
+                             or info["four_bet_pre"])
+    if showed_pre_aggression and passive and not board_present:
+        return "NUTTED", "none"
+
+    # (D) Preflop ladder (no postflop raise). If a board is out and they've
+    # continued (called) postflop, narrow by board connection (leak #1).
+    cont_mode = "connect" if (board_present and info["continued_postflop"]) else "none"
+    if info["four_bet_pre"]:
+        return "NUTTED", cont_mode
     if info["threebet_pre"]:
-        return "THREEBET"
+        return "THREEBET", cont_mode
     if info["raised_pre"]:
-        return "OPEN"
+        return _open_tier_str(state, villain_seat), cont_mode
 
-    # If they only called preflop and have now raised postflop, that's
-    # a strong signal too — treat as THREEBET-ish (made-hand range).
-    if info["raised_postflop"]:
-        return "THREEBET" if not _villain_is_passive(stats) else "NUTTED"
-
-    # (5) limp/call only -> wide weak range.
+    # (E) Limped/called preflop.
     if info["voluntary_pre"]:
-        return "WIDE"
+        return "WIDE", cont_mode
 
-    # (6) blinds only, hasn't acted yet -> fall back to random sampling.
-    return "UNKNOWN"
+    # (F) Blinds only / hasn't acted -> random fallback.
+    return "UNKNOWN", "none"
+
+
+def _range_for_villain(state, villain_seat, villain_bot_id):
+    """Back-compat shim: the range-string component of
+    _range_and_filter_for_villain (some callers/tests want just the bucket)."""
+    return _range_and_filter_for_villain(state, villain_seat, villain_bot_id)[0]
 
 
 def _live_villains(state):
@@ -663,60 +765,222 @@ def _filter_range_against_deck(hand_range, dead_cards):
     return out
 
 
+def _combo_connects_to_board(combo, board_c):
+    """Permissive board-connection test (v8 leak #1). True if `combo` (2 eval7
+    Cards) plausibly continues on `board_c`: a pair with the board, a pocket
+    pair, a flush or 4-to-a-flush draw, a made straight / open-ender / gutshot,
+    or two overcards to the board. Deliberately loose — the goal is to drop the
+    pure air a villain who keeps betting/calling would have folded, not to
+    compute exact hand classes. On any parse failure it keeps the combo."""
+    try:
+        cr = [_CARD_STR.get(c, str(c)) for c in combo]
+        br = [_CARD_STR.get(c, str(c)) for c in board_c]
+        c_ranks = [s[0] for s in cr]
+        c_suits = [s[1] for s in cr]
+        b_ranks = [s[0] for s in br]
+        b_suits = [s[1] for s in br]
+
+        if c_ranks[0] == c_ranks[1]:                  # pocket pair (incl. set)
+            return True
+        if c_ranks[0] in b_ranks or c_ranks[1] in b_ranks:   # pair with board
+            return True
+        for s in _SUITS:                              # flush / 4-flush draw
+            if (c_suits + b_suits).count(s) >= 4:
+                return True
+
+        vals = set()                                  # straight / draw window
+        for r in c_ranks + b_ranks:
+            v = _RANK_VAL.get(r, 0)
+            if v:
+                vals.add(v)
+                if v == 14:
+                    vals.add(1)                       # wheel ace
+        sv = sorted(vals)
+        for lo in range(1, 11):
+            if sum(1 for v in sv if lo <= v <= lo + 4) >= 4:
+                return True
+
+        top_board = max((_RANK_VAL.get(r, 0) for r in b_ranks), default=0)
+        if (_RANK_VAL.get(c_ranks[0], 0) > top_board
+                and _RANK_VAL.get(c_ranks[1], 0) > top_board):   # two overcards
+            return True
+        return False
+    except Exception:
+        return True
+
+
+def _combo_is_strong_on_board(combo, board_c):
+    """Strict board filter for a confirmed-passive villain's postflop RAISE
+    (v8 leak #6). Keep only genuinely strong holdings: two pair or better, a
+    set/trips, an overpair, top pair with a strong (Q+) kicker, top pair plus a
+    draw, a made flush/straight, or a big combo draw (flush draw + open-ender,
+    or flush draw + an overcard). Everything else — air, weak/underpair, naked
+    overcards — is dropped, because passive players rarely raise those. On any
+    parse failure, falls back to the permissive connection test."""
+    try:
+        cr = [_CARD_STR.get(c, str(c)) for c in combo]
+        br = [_CARD_STR.get(c, str(c)) for c in board_c]
+        all_ranks = [s[0] for s in cr + br]
+        all_suits = [s[1] for s in cr + br]
+        c_ranks = [s[0] for s in cr]
+        b_ranks = [s[0] for s in br]
+        b_vals = [_RANK_VAL.get(r, 0) for r in b_ranks]
+        top_board = max(b_vals) if b_vals else 0
+
+        counts = {}
+        for r in all_ranks:
+            counts[r] = counts.get(r, 0) + 1
+        mult = sorted(counts.values(), reverse=True)
+        if mult and mult[0] >= 3:                     # trips / set / quads
+            return True
+        if mult.count(2) >= 2:                        # two pair
+            return True
+
+        suit_max = max((all_suits.count(s) for s in set(all_suits)), default=0)
+        made_flush = suit_max >= 5
+        flush_draw = suit_max == 4
+        if made_flush:
+            return True
+
+        vals = set()
+        for r in all_ranks:
+            v = _RANK_VAL.get(r, 0)
+            if v:
+                vals.add(v)
+                if v == 14:
+                    vals.add(1)
+        sv = sorted(vals)
+        made_straight = oesd = False
+        for lo in range(1, 11):
+            hits = sum(1 for v in sv if lo <= v <= lo + 4)
+            if hits >= 5:
+                made_straight = True
+            elif hits >= 4:
+                oesd = True
+        if made_straight:
+            return True
+
+        if c_ranks[0] == c_ranks[1]:                  # pocket pair
+            return _RANK_VAL.get(c_ranks[0], 0) > top_board   # overpair only
+
+        paired_with_board = (c_ranks[0] in b_ranks) or (c_ranks[1] in b_ranks)
+        if paired_with_board:
+            pair_val = kicker_val = 0
+            for hc in cr:
+                if hc[0] in b_ranks:
+                    pair_val = max(pair_val, _RANK_VAL.get(hc[0], 0))
+                else:
+                    kicker_val = max(kicker_val, _RANK_VAL.get(hc[0], 0))
+            is_top_pair = pair_val >= top_board
+            if is_top_pair and kicker_val >= 12:      # top pair, Q+ kicker
+                return True
+            if is_top_pair and (flush_draw or oesd):  # top pair + draw
+                return True
+            return False
+
+        if flush_draw and oesd:                       # combo draw
+            return True
+        overcards = sum(1 for hc in c_ranks if _RANK_VAL.get(hc, 0) > top_board)
+        if flush_draw and overcards >= 1:             # flush draw + overcard
+            return True
+        return False
+    except Exception:
+        return _combo_connects_to_board(combo, board_c)
+
+
 def _equity_vs_one_range(hole_c, board_c, opp_range_str, rng,
-                         time_budget=0.30, max_iters=2000):
+                         time_budget=0.30, max_iters=2000,
+                         board_filter_mode="none"):
     """Heads-up: hero vs one range. Deterministic — we drive the MC with our
     spot-seeded RNG so paired A/B variance reduction holds. eval7's native
     py_hand_vs_range_monte_carlo uses its own internal RNG that we can't seed,
     which breaks pairing — so we route the single-villain case through the
     same multi-range MC as multiway (with a 1-element opp list). It's a few
     ms slower than the native call but still well under any time budget.
+
+    board_filter_mode ('none'/'connect'/'strong') is forwarded so the HU path
+    gets the same board-aware range narrowing as multiway (v8 leaks #1/#6).
     """
     if not _HAVE_EVAL7:
         return None
     if opp_range_str == "UNKNOWN":
         return None
     return _equity_vs_multi_range(hole_c, board_c, [opp_range_str], rng,
-                                  time_budget=time_budget, max_iters=max_iters)
+                                  time_budget=time_budget, max_iters=max_iters,
+                                  board_filter_modes=[board_filter_mode])
 
 
 def _equity_vs_multi_range(hole_c, board_c, opp_range_strs, rng,
-                           time_budget=0.30, max_iters=1500):
+                           time_budget=0.30, max_iters=1500,
+                           board_filter_modes=None):
     """Multiway: roll our own MC drawing one combo per opponent from each
     range (or all-hands for UNKNOWN), rejecting card conflicts. Slower than
-    eval7's native HU path but accurate for multiway."""
+    eval7's native HU path but accurate for multiway.
+
+    board_filter_modes: optional list parallel to opp_range_strs. Each entry is
+    'none' / 'connect' / 'strong' and, when a board is present, intersects that
+    opponent's range with _combo_connects_to_board (drop air) or
+    _combo_is_strong_on_board (keep only strong made hands / big draws). If a
+    filter empties a pool we keep the unfiltered pool rather than going random,
+    so a real (if loose) read is never silently discarded. None => no filtering
+    (back-compat with all earlier callers)."""
     if not _HAVE_EVAL7 or not _FULL_DECK:
         return None
 
-    # Build per-opponent combo lists, filtered against hero+board cards.
+    # Build per-opponent combo lists, filtered against hero+board cards and,
+    # optionally, against the board texture (connect/strong).
     dead_base = set(hole_c) | set(board_c)
     opp_pools = []
-    for rs in opp_range_strs:
+    for i, rs in enumerate(opp_range_strs):
+        mode = "none"
+        if board_filter_modes is not None and i < len(board_filter_modes):
+            mode = board_filter_modes[i] or "none"
         if rs == "UNKNOWN":
             opp_pools.append(None)        # signal: any 2 cards
-        else:
-            hr = _HANDRANGES.get(rs)
-            pool = _filter_range_against_deck(hr, dead_base)
-            if not pool:
-                # Tight range eliminated by hero+board -> fall back to random
-                # for this opp (rather than crashing or returning None).
-                opp_pools.append(None)
+            continue
+        hr = _HANDRANGES.get(rs)
+        pool = _filter_range_against_deck(hr, dead_base)
+        if not pool:
+            # Tight range eliminated by hero+board -> fall back to random
+            # for this opp (rather than crashing or returning None).
+            opp_pools.append(None)
+            continue
+        if board_c and mode in ("connect", "strong"):
+            if mode == "strong":
+                filtered = [cb for cb in pool
+                            if _combo_is_strong_on_board(cb, board_c)]
             else:
-                opp_pools.append(pool)
+                filtered = [cb for cb in pool
+                            if _combo_connects_to_board(cb, board_c)]
+            if filtered:                  # never empty a real read to random
+                pool = filtered
+        opp_pools.append(pool)
 
     need_board = 5 - len(board_c)
     if need_board < 0:
         return None
 
+    # Separate the loop/budget counter (attempts) from the count of trials that
+    # actually produced a showdown (trials). v7 incremented a single `iters` on
+    # failed (card-conflict / dead) trials too, inflating the denominator and
+    # deflating equity in tight/multiway spots. (v8 leak #2 — highest priority.)
     wins = ties = 0
-    iters = 0
+    trials = 0
+    attempts = 0
     t0 = time.perf_counter()
     _ev = eval7.evaluate
 
     try:
-        while iters < max_iters:
-            if iters >= _EQ_MIN_ITERS and (time.perf_counter() - t0) > time_budget:
-                break
+        while attempts < max_iters:
+            attempts += 1
+            # Time guard: only fire once we've either gathered a meaningful
+            # number of successful trials or simply tried a lot (so a heavily
+            # conflicted range can't loop forever, yet normal spots still reach
+            # _EQ_MIN_ITERS real samples).
+            if (attempts > _EQ_MIN_ITERS
+                    and (time.perf_counter() - t0) > time_budget):
+                if trials >= _EQ_MIN_ITERS or attempts >= max_iters:
+                    break
 
             used = set(dead_base)
             opp_hands = []
@@ -746,15 +1010,13 @@ def _equity_vs_multi_range(hole_c, board_c, opp_range_strs, rng,
                         failed = True
                         break
             if failed:
-                iters += 1                  # count toward budget anyway
-                continue
+                continue                  # dead trial: NOT counted in trials
 
             # Fill board.
             if need_board > 0:
                 avail = [c for c in _FULL_DECK if c not in used]
                 if len(avail) < need_board:
-                    iters += 1
-                    continue
+                    continue              # dead trial: NOT counted in trials
                 sim_board = board_c + rng.sample(avail, need_board)
             else:
                 sim_board = board_c
@@ -765,14 +1027,14 @@ def _equity_vs_multi_range(hole_c, board_c, opp_range_strs, rng,
                 wins += 1
             elif hero == best_opp:
                 ties += 1
-            iters += 1
+            trials += 1
     except Exception:
-        if iters < _EQ_MIN_ITERS:
+        if trials < _EQ_MIN_ITERS:
             return None
 
-    if iters == 0:
+    if trials == 0:
         return None
-    return (wins + ties * 0.5) / iters
+    return (wins + ties * 0.5) / trials
 
 
 def equity_vs_range(hole, board, state, time_budget=None, rng=None):
@@ -799,8 +1061,14 @@ def equity_vs_range(hole, board, state, time_budget=None, rng=None):
     villains = _live_villains(state)
     if not villains:
         return None
-    range_strs = [_range_for_villain(state, seat, bid)
-                  for seat, bid in villains]
+
+    # Each villain gets a (range bucket, board-filter mode) pair. The mode is
+    # 'none' / 'connect' / 'strong' and tells the MC how to intersect that
+    # villain's preflop bucket with THIS board (v8 leaks #1/#6).
+    pairs = [_range_and_filter_for_villain(state, seat, bid)
+             for seat, bid in villains]
+    range_strs = [p[0] for p in pairs]
+    filter_modes = [p[1] for p in pairs]
 
     # If every opponent is UNKNOWN, we have nothing to do — let the caller
     # use the cheaper equity_vs_random.
@@ -810,15 +1078,18 @@ def equity_vs_range(hole, board, state, time_budget=None, rng=None):
     if rng is None:
         rng = random.Random()
 
-    # Heads-up: use eval7's native fast path. ~10x faster than our own MC loop.
+    # Heads-up: route through the single-range path (still our seeded MC, with
+    # the board filter applied).
     if len(range_strs) == 1 and range_strs[0] != "UNKNOWN":
         eq = _equity_vs_one_range(hole_c, board_c, range_strs[0], rng,
-                                  time_budget=time_budget or 0.30)
+                                  time_budget=time_budget or 0.30,
+                                  board_filter_mode=filter_modes[0])
         return eq
 
     # Multiway (or HU with UNKNOWN mixed in): our own MC.
     return _equity_vs_multi_range(hole_c, board_c, range_strs, rng,
-                                  time_budget=time_budget or 0.30)
+                                  time_budget=time_budget or 0.30,
+                                  board_filter_modes=filter_modes)
 
 
 def _hero_equity(hole, board, state, n_opp, rng):
@@ -1462,15 +1733,43 @@ def _preflop_history(state):
 
 
 def _is_facing_jam(state):
-    """True if calling the current bet would put us all-in."""
+    """True if we're actually facing an all-in right now.
+
+    v7 returned True if ANY all_in appeared in the last 8 action-log entries —
+    which false-positived on stale jams that had already been called and were
+    no longer the live decision (e.g. a short stack jammed, two players called,
+    and now we're facing a normal-sized bet on a later street). v8 bases this on
+    the live money instead. (Leak #7.)
+    """
     owed = state.get("amount_owed", 0)
     stack = state.get("your_stack", 0)
+    # Primary signal: calling would put (or already puts) us all-in.
     if stack > 0 and owed >= stack:
         return True
-    # Also check the log for a recent all_in action.
-    for a in (state.get("action_log") or [])[-8:]:
-        if isinstance(a, dict) and a.get("action") == "all_in":
-            return True
+    # If the engine exposes a betting cap and the current bet is already at it,
+    # the action is effectively a jam. (Field usually absent -> skipped safely.)
+    current_bet = state.get("current_bet", 0)
+    max_to = state.get("max_raise_to", None)
+    if max_to is not None and current_bet >= max_to and current_bet > 0:
+        return True
+    # Precise live check: is there an unmet all-in in front of us THIS street?
+    # i.e. a live opponent who is all-in (state == "all_in" or stack == 0) and
+    # whose committed amount this street exceeds ours, so we still owe them.
+    me = state.get("seat_to_act")
+    my_bet = state.get("your_bet_this_street", 0)
+    for p in state.get("players") or []:
+        if not isinstance(p, dict):
+            continue
+        try:
+            if p.get("seat") == me:
+                continue
+            if p.get("is_folded") or p.get("state") == "busted":
+                continue
+            is_all_in = (p.get("state") == "all_in") or (p.get("stack", 1) == 0)
+            if is_all_in and p.get("bet_this_street", 0) > my_bet:
+                return True
+        except (KeyError, TypeError):
+            continue
     return False
 
 
@@ -1603,11 +1902,18 @@ def _preflop_v6(state):
         return _open_branch(state, hand, pos, rng)
 
     # There's been at least one raise.
+    if history["raises"] >= 2 and not history["first_raiser_was_us"]:
+        # Open + 3-bet in front of us, we're cold. This is NOT an open-defense
+        # spot — use the cold-4bet-or-fold table. (Big 3-bets that would commit
+        # us are already handled by the equity filter near the top of this
+        # function, so this only fires for normal-sized 3-bets.) (v8 leak #3.)
+        return _cold_4bet_branch(state, hand, pos, history, rng)
+
     if history["first_raiser_was_us"]:
         # We opened and got 3-bet (or 5-bet, etc.). Use 4-bet defense.
         return _four_bet_branch(state, hand, rng)
 
-    # Someone else opened.
+    # Someone else opened (single raise, we're facing it). Open-defense table.
     return _defense_branch(state, hand, pos, history, rng)
 
 
@@ -1682,6 +1988,48 @@ def _four_bet_branch(state, hand, rng):
         return {"action": "raise", "amount": target}
     if choice == "call":
         return {"action": "call"}
+    return {"action": "fold"}
+
+
+# ---- Cold 4-bet defense (someone opened, someone else 3-bet, we're cold) ----
+# Deliberately tight and position-agnostic: getting this spot wrong is far more
+# expensive than folding a marginal hand, and we have no positional reads we
+# trust here. Premiums 4-bet for value, a tiny suited-ace slice bluffs, and a
+# narrow band flats to avoid folding QQ/AK/JJ outright (which would be a glaring
+# over-fold of our own strong hands). Everything else folds. (v8 leak #3.)
+_COLD_4BET_VALUE = {"AA", "KK", "QQ", "AKs", "AKo"}
+_COLD_4BET_BLUFF = {"A5s", "A4s"}
+_COLD_CALL_4BET = {"JJ", "TT", "AQs"}
+
+
+def _cold_4bet_branch(state, hand, pos, history, rng):
+    """Facing an open + a 3-bet before we've put money in (raises >= 2 and we
+    weren't the first raiser). Cold-4bet-or-fold, with a small flat range.
+
+    Sizing mirrors _four_bet_branch: ~2.2x the current bet, snapped to the
+    legal [min_raise_to, cap] band, jamming if that clips our stack. (Note:
+    this is current_bet * 2.2, NOT _raise_to(state, 2.2) — in this engine
+    _raise_to adds 2.2*pot ON TOP of the current bet, which would be a wild
+    over-raise. The review's literal snippet had that bug; we size correctly.)
+    """
+    def _cold_4bet_to():
+        three_bet_to = state.get("current_bet", 0)
+        target = int(three_bet_to * 2.2)
+        min_to = state.get("min_raise_to", 0)
+        cap = state.get("your_stack", 0) + state.get("your_bet_this_street", 0)
+        target = min(max(target, min_to), cap)
+        if target >= cap:
+            return {"action": "all_in"}
+        return {"action": "raise", "amount": target}
+
+    if hand in _COLD_4BET_VALUE:
+        return _cold_4bet_to()
+    if hand in _COLD_4BET_BLUFF and rng.random() < 0.35:
+        return _cold_4bet_to()
+    if hand in _COLD_CALL_4BET:
+        return {"action": "call"}
+    if state.get("can_check", False):
+        return {"action": "check"}
     return {"action": "fold"}
 
 
@@ -1900,58 +2248,46 @@ def _safetag(state):
     return _postflop_by_heuristic(state, hole, board, pos, can_check, rng)
 
 
-# ---- v14 leak-fix flags (ALL OFF by default -> identical to v7_m2) ----
-FIX_SIZING   = False   # #1  one bet size across the value range (kill the tell)
-FIX_TRAP     = True   # #2  sometimes CHECK strong hands so checks aren't capped
-FIX_RIVER    = False   # #3  bigger value sizing on the river (value half only)
-FIX_MULTIWAY = False   # #5  tighten value/bet thresholds with more opponents
-
-UNIFORM_SIZE    = 0.66  # FIX_SIZING: single size for every value bet & steal
-TRAP_FREQ       = 0.25  # FIX_TRAP: P(check) with a strong checked-to hand
-RIVER_VALUE_SIZE= 0.95  # FIX_RIVER: river value-bet size (>= normal)
-MULTIWAY_BUMP   = 0.06  # FIX_MULTIWAY: +threshold per extra live opponent
-
-
 def _postflop_by_equity(state, eq, pos, can_check, board, rng):
     req = _required_equity(state)
 
-    is_river = len(board) >= 5
-    th_strong, th_good, th_marg = 0.72, 0.55, 0.42
-    if FIX_MULTIWAY:
-        n_opp = max(1, _n_live_opponents(state))
-        bump = MULTIWAY_BUMP * (n_opp - 1)           # 0 heads-up, +bump per extra
-        th_strong = min(0.95, th_strong + bump)
-        th_good = th_good + bump
-    if FIX_SIZING:
-        s_nut = s_strong = s_good = s_steal = UNIFORM_SIZE
-    else:
-        s_nut, s_strong, s_good, s_steal = 0.9, 0.7, 0.55, 0.5
-    if FIX_RIVER and is_river:                        # polarize value bigger on river
-        s_nut = max(s_nut, RIVER_VALUE_SIZE)
-        s_strong = max(s_strong, RIVER_VALUE_SIZE)
-
     # Strong value: bet/raise.
-    if eq >= th_strong:
+    if eq >= 0.72:
         if can_check:
-            if FIX_TRAP and rng.random() < TRAP_FREQ:  # trap: strong hand checks
-                return {"action": "check"}
-            return {"action": "raise", "amount": _raise_to(state, s_strong)}
-        if eq >= 0.85 and rng.random() < 0.6:
-            return {"action": "raise", "amount": _raise_to(state, s_nut)}
+            # Leading: unchanged value bet.
+            return {"action": "raise", "amount": _raise_to(state, 0.7)}
+        # Facing a bet. v7 only ever raised here at eq>=0.85 (and only 60% of
+        # the time), flat-calling everything from 0.72-0.85 — which leaves us
+        # capped and lets opponents bet-fold thinly to realize equity cheaply.
+        # v8 adds frequency- and texture-dependent thin value raises while
+        # keeping a meaningful call component for range protection. (Leak #4.)
+        wet = not _board_is_dry(board)
+        if eq >= 0.85:
+            if rng.random() < 0.70:
+                return {"action": "raise", "amount": _raise_to(state, 0.9)}
+            return {"action": "call"}
+        if eq >= 0.80:
+            if rng.random() < 0.55:
+                return {"action": "raise", "amount": _raise_to(state, 0.8)}
+            return {"action": "call"}
+        # 0.72-0.80: only raise on wetter boards (where protection/denial has
+        # the most value), otherwise just call.
+        if wet and rng.random() < 0.45:
+            return {"action": "raise", "amount": _raise_to(state, 0.75)}
         return {"action": "call"}
 
     # Good but not nutted: bet for value / call profitably.
-    if eq >= th_good:
+    if eq >= 0.55:
         if can_check:
             if pos > 0.5 and rng.random() < 0.65:
-                return {"action": "raise", "amount": _raise_to(state, s_good)}
+                return {"action": "raise", "amount": _raise_to(state, 0.55)}
             return {"action": "check"}
         if eq >= req + 0.05:
             return {"action": "call"}
         return {"action": "fold"}
 
     # Marginal showdown / draws: pot-odds call, occasional thin probe.
-    if eq >= th_marg:
+    if eq >= 0.42:
         if can_check:
             return {"action": "check"}
         if eq >= req:
@@ -1961,7 +2297,7 @@ def _postflop_by_equity(state, eq, pos, can_check, board, rng):
     # Weak: mostly give up; rare dry-board steal in position.
     if can_check:
         if pos > 0.6 and _board_is_dry(board) and rng.random() < 0.18:
-            return {"action": "raise", "amount": _raise_to(state, s_steal)}
+            return {"action": "raise", "amount": _raise_to(state, 0.5)}
         return {"action": "check"}
     return {"action": "fold"}
 
@@ -2005,7 +2341,13 @@ def _sanitize(action, state):
     a = str(action.get("action", "fold")).lower().strip()
     can_check = state.get("can_check", False)
     if a == "check":
-        return {"action": "check"} if can_check else {"action": "call"}
+        # An illegal check (we're facing a bet) becomes a FOLD, not a blind
+        # call. v7 turned it into a call, so any upstream bug returning "check"
+        # in a no-check spot silently became an expensive station-call. Folding
+        # is the safe failure mode. ("check" is only ever returned under a
+        # can_check guard in normal play, so this fires only on a real bug.)
+        # (v8 leak #8.)
+        return {"action": "check"} if can_check else {"action": "fold"}
     if a == "call":
         return {"action": "check"} if can_check else {"action": "call"}
     if a == "all_in":

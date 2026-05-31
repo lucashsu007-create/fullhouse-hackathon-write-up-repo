@@ -1,7 +1,6 @@
 # Poker Bot — Technical Report
 
 **Current frozen baseline: V7-M2 (fix)** — `v7_m2` with the 4-bet-defense gate bug patched. **→ Superseded as the recommended ship by `v16_noranges`, validated at full power (see POWERED RESULT notice below). V7-M2 (fix) is retained as the ultra-safe fallback.**
-Built for the Fullhouse Hackathon, qualifier 1–2 June 2026 (**deadline Monday 1 June 12:00 noon UK ≈ 11:00 UTC** — per the org email; supersedes the earlier "31 May 23:59 UTC"), finals 5 June. **Note:** bots can be re-uploaded *during* the qualifier (the version at the start of each match plays), so the optimal plan is a small library of population-tuned configs + hot-swap, not one frozen bot — see the decomposition note's strategy section.
 
 > ## ✅ POWERED RESULT — 31 May 2026 (supersedes the ship decision in every notice below)
 > **Two full-power batches on the eval7 rig (100 matches × 2500 hands × 10 seeds = 2.5M hands/bot/field; all three bots paired in-job; 0 errors; 34–45 s/job) overturn the "ship V7-M2, the upgrades fail the floor" conclusion. Both upgrades clear the floor in EVERY field tested.**

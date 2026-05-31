@@ -1084,9 +1084,9 @@ with tab_run:
                      "the field + 1 hero, so the number of heroes is unrestricted "
                      "(capped at 7 here for sanity).",
             )
-            if len(hero_choices) > 7:
-                st.warning("Pick at most 7 heroes. Extra selections will be ignored.")
-                hero_choices = hero_choices[:7]
+            if len(hero_choices) > 10:
+                st.warning("Pick at most 10 heroes. Extra selections will be ignored.")
+                hero_choices = hero_choices[:10]
             baseline_id = (
                 st.selectbox(
                     "Baseline (every other hero is measured against this one)",

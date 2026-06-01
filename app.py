@@ -2349,6 +2349,24 @@ with tab_results:
 # upload plumbing + rendering. The histories it reads are a SEPARATE artifact
 # from the backtest result JSONs the run queue produces.
 # ---------------------------------------------------------------------------
+# ============================================================================
+# UPGRADED Tab 4 — D1 Profiler  (drop-in replacement for app.py)
+#
+# HOW TO APPLY: in app.py, delete everything from the line
+#     with tab_profiler:
+# to the END OF THE FILE, and paste this block in its place. Nothing above
+# that line changes — this uses your existing d1_profiler import, the
+# histories_dir from the sidebar, and your widget/style conventions.
+#
+# What's new vs your current Tab 4 (which only had sniff / profile / ranges):
+#   - amount-convention detector (defaults to 'mixed', the engine's real style)
+#   - chip-aware player table: VPIP/PFR/3bet/AI%, fold-call-raise vs bet,
+#     river-big-bet rate + value proxy, WTSD/W$SD, net-per-100, exploit flags
+#   - river big-bet value/bluff read incl. made-hand strength split
+#   - hero loss attribution (cooler vs value-own), engine fault count,
+#     river_underbluff_fold EV, and a gated patch recommendation
+#   - one-click full CSV report bundle (.zip) download
+# ============================================================================
 
 with tab_profiler:
     st.subheader("D1 Field Profiler & Range Calibrator")
@@ -2359,11 +2377,16 @@ with tab_profiler:
             "Fix: place `d1_profiler.py` next to `app.py`."
         )
     else:
+        import io as _io
+        import zipfile as _zipfile
+
         st.caption(
             "Turns downloadable D1 hand histories into a per-opponent "
-            "exploitability profile and showdown-calibrated range strings for "
-            "`_RANGE_STRINGS`. These histories are separate from the backtest "
-            "results in tab 3 — upload them below."
+            "exploitability profile, a chip-aware table, a river value/bluff "
+            "read, hero loss attribution, and a finals patch recommendation — "
+            "plus showdown-calibrated range strings for `_RANGE_STRINGS`. These "
+            "histories are separate from the backtest results in tab 3 — upload "
+            "them below."
         )
 
         hdir = st.session_state.histories_dir
@@ -2393,27 +2416,336 @@ with tab_profiler:
             st.info("No hand-history JSON in the histories dir yet. Upload some "
                     "above (or drop files into the dir) to enable profiling.")
 
-        # ----- Sniff schema -----
-        with st.expander("Sniff schema (inspect an unknown JSON layout)"):
+        # ----- Schema + amount-convention recon -----
+        with st.expander("Schema & amount convention (run first on a new export)"):
             st.caption(
-                "Run this first on a new D1 export. The downloadable format isn't "
-                "documented, so the profiler maps fields via a KEYMAP with "
-                "fallbacks. If any field shows `<MISSING>`, add the real key to "
-                "`KEYMAP` in `d1_profiler.py` and re-run — that block is the only "
-                "thing meant to be edited."
+                "The downloadable format isn't documented, so the profiler maps "
+                "fields via a KEYMAP with fallbacks. Sniff a file to see the "
+                "layout; if a field shows `<MISSING>`, add the real key to "
+                "`KEYMAP` in `d1_profiler.py`. The chip-aware analyses below also "
+                "need the amount convention pinned — detect it here."
             )
-            if st.button("Sniff first file", key="profiler_sniff",
-                         disabled=not has_files):
+            sc1, sc2 = st.columns(2)
+            if sc1.button("Sniff first file", key="profiler_sniff",
+                          disabled=not has_files):
                 try:
                     st.code(d1_profiler.sniff_report(hdir), language="text")
                 except Exception as exc:
                     st.error(f"Sniff failed: {exc}")
+            if sc2.button("Detect amount convention", key="profiler_conv",
+                          disabled=not has_files):
+                try:
+                    ac = d1_profiler.detect_amount_convention(hdir)
+                    verdict = ac["verdict"].upper()
+                    msg = f"Convention: **{verdict}** (confidence: {ac['confidence']})"
+                    if ac["verdict"] == "mixed":
+                        st.success(msg + " — set `AMOUNT_IS_CUMULATIVE = \"mixed\"` "
+                                   "(already the default).")
+                    elif ac["verdict"] == "unknown":
+                        st.warning(msg + " — not enough signal yet; the chip-aware "
+                                   "tables fall back to the module default.")
+                    else:
+                        st.info(msg)
+                    h3 = ac["h3"]
+                    st.caption(
+                        f"H3 pot cross-check ({h3.get('source')}): matched by "
+                        f"incr={h3.get('incr')}, cumul={h3.get('cumul')}, "
+                        f"mixed={h3.get('mixed')} of {h3.get('matched')} hands "
+                        f"(unexplained {h3.get('unexplained')})."
+                    )
+                    for note in ac.get("notes", []):
+                        st.caption("• " + note)
+                except Exception as exc:
+                    st.error(f"Convention detection failed: {exc}")
 
-        # ----- Profile opponents -----
-        with st.expander("Profile opponents (exploitability stats)",
+        # ----- Chip-aware analysis -----------------------------------------
+        st.markdown("---")
+        st.markdown("#### Chip-aware analysis")
+        st.caption(
+            "VPIP/PFR/WTSD, river value-vs-bluff, hero loss attribution and a "
+            "patch recommendation. These reconstruct chips from the action log, "
+            "so they need the amount convention; it defaults to **mixed** (the "
+            "fullhouse-engine logging style — calls log chips added, raises log "
+            f"the 'to' total). Hand evaluator in use: **{d1_profiler.evaluator_name()}**."
+        )
+        cc1, cc2 = st.columns([2, 2])
+        hero = cc1.text_input(
+            "Your bot id (hero) — excluded from field tables, analysed below",
+            key="profiler_chip_hero",
+            placeholder="e.g. v16_ship",
+            help="Must match the bot_id exactly as it appears in the JSON. "
+                 "Leave blank to profile the whole field with no hero analysis.",
+        ).strip()
+        conv_choice = cc2.selectbox(
+            "Amount convention",
+            options=["mixed", "auto-detect", "cumulative", "incremental"],
+            index=0, key="profiler_conv_choice",
+            help="'mixed' is correct for the fullhouse-engine. 'auto-detect' "
+                 "runs the pot cross-check on these files and uses its verdict.",
+        )
+
+        def _resolve_conv():
+            """Map the convention choice to the value d1_profiler expects."""
+            if conv_choice == "cumulative":
+                return True
+            if conv_choice == "incremental":
+                return False
+            if conv_choice == "auto-detect":
+                try:
+                    v = d1_profiler.detect_amount_convention(hdir).get(
+                        "set_AMOUNT_IS_CUMULATIVE")
+                    return v if v is not None else "mixed"
+                except Exception:
+                    return "mixed"
+            return "mixed"
+
+        def _pct(x):
+            return None if x is None else round(100 * x, 1)
+
+        # ----- Chip-aware player table -----
+        with st.expander("Player table (VPIP/PFR/WTSD/W$SD + net per 100)",
                          expanded=has_files):
-            if st.button("Profile field", key="profiler_profile",
+            if st.button("Build chip table", key="profiler_chips",
                          disabled=not has_files, type="primary"):
+                try:
+                    conv = _resolve_conv()
+                    n, agg, net_sum = d1_profiler.profile_chips(
+                        hdir, amount_is_cumulative=conv)
+                    rows = d1_profiler.compute_chip_rows(agg, net_sum)
+                except Exception as exc:
+                    st.error(f"Chip profile failed: {exc}")
+                    n, rows, conv = 0, [], None
+                if not rows:
+                    st.warning("No hands parsed. Use **Sniff schema** above and "
+                               "check KEYMAP, or confirm the convention.")
+                else:
+                    field = [r for r in rows if not hero or r["opponent"] != hero]
+                    table = [{
+                        "opponent": r["opponent"], "hands": r["hands"],
+                        "VPIP%": _pct(r["vpip"]), "PFR%": _pct(r["pfr"]),
+                        "3bet%": _pct(r["threebet"]), "AI%": _pct(r["allin"]),
+                        "fold→bet%": _pct(r["fold_vs_bet"]),
+                        "call→bet%": _pct(r["call_vs_bet"]),
+                        "raise→bet%": _pct(r["raise_vs_bet"]),
+                        "rivBB%": _pct(r["river_big_rate"]),
+                        "BBval%": _pct(r["river_big_value_proxy"]),
+                        "WTSD%": _pct(r["wtsd"]), "W$SD%": _pct(r["wsd"]),
+                        "net/100": (None if r["net_per_100"] is None
+                                    else round(r["net_per_100"])),
+                        "flags": ", ".join(r["flags"]),
+                    } for r in field]
+                    st.caption(
+                        f"Profiled {n} hands · {len(field)} opponents · "
+                        f"convention = {d1_profiler._mode_of(conv)}"
+                        + (f" · hero `{hero}` excluded" if hero else "")
+                        + ". Blank cells = too small a denominator to rate."
+                    )
+                    st.dataframe(table, use_container_width=True, hide_index=True)
+                    bad = [(r["opponent"], r["unresolved"], r["pot_mismatch"])
+                           for r in field
+                           if r["unresolved"] or r["pot_mismatch"]]
+                    if bad:
+                        st.caption(
+                            "Data-quality note (unresolved showdowns / pot "
+                            "mismatches per seat): "
+                            + "; ".join(f"{o}: {u} unresolved, {m} mismatch"
+                                        for o, u, m in bad)
+                            + ". A nonzero mismatch usually means the wrong "
+                              "convention — try Auto-detect."
+                        )
+                    st.caption(
+                        "Flags: **STATION(calls-big)** / **OVERFOLDS-vs-bet** "
+                        "→ exploit with sizing; **PERMA-JAM** → trap; "
+                        "**RIVER-BOMBER** → over-folds-to-river candidate; "
+                        "**NIT** → steal more. `net/100` is chips won per 100 "
+                        "hands, the bottom line per opponent."
+                    )
+
+        # ----- River big-bet value / bluff read -----
+        with st.expander("River big bets — value vs bluff (the underbluff signal)"):
+            st.caption(
+                f"Big = a river bet ≥ {int(100 * d1_profiler.BIG_BET_FRAC)}% of "
+                "pot. 'val% called' is how often a CALLED big bet held the winner "
+                "(the population your call faces); ≥75% means the field "
+                "underbluffs, favouring river_underbluff_fold. The strength split "
+                "sharpens that from won/lost to the bettor's actual made hand."
+            )
+            if st.button("Analyse river big bets", key="profiler_river",
+                         disabled=not has_files):
+                try:
+                    conv = _resolve_conv()
+                    r_agg, _ev = d1_profiler.river_big_bets(
+                        hdir, amount_is_cumulative=conv)
+                    r_rows = d1_profiler.compute_river_rows(r_agg)
+                    strength = d1_profiler.river_big_bet_strength(
+                        hdir, hero=hero or None, amount_is_cumulative=conv)
+                except Exception as exc:
+                    st.error(f"River analysis failed: {exc}")
+                    r_rows, strength = [], {"field": {}}
+                rows = [r for r in r_rows if not hero or r["seat"] != hero]
+                if not any(r["total"] for r in rows):
+                    st.info("No big river bets in this sample (a passive field "
+                            "checks the river down) — not a parse error.")
+                else:
+                    table = [{
+                        "seat": r["seat"], "big bets": r["total"],
+                        "foldout": r["foldout"], "called": r["called"],
+                        "value": r["value"], "caught": r["caught"],
+                        "val% called": _pct(r["value_rate_called"]),
+                    } for r in rows]
+                    st.dataframe(table, use_container_width=True, hide_index=True)
+                    tot = sum(r["total"] for r in rows)
+                    called = sum(r["called"] for r in rows)
+                    value = sum(r["value"] for r in rows)
+                    if called:
+                        st.caption(f"Field: {tot} big river bets · {called} called "
+                                   f"· {value}/{called} = {100 * value / called:.0f}% "
+                                   "value when called.")
+                f = strength.get("field", {})
+                ncl = f.get("classified", 0)
+                if ncl:
+                    val, marg, bluff = (f.get("value", 0), f.get("marginal", 0),
+                                        f.get("bluff", 0))
+                    st.markdown("**Made-hand strength of called big river bets** "
+                                f"(n={ncl}, {d1_profiler.evaluator_name()})")
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("value (≥2 pair)", f"{val}", f"{100*val/ncl:.0f}%")
+                    m2.metric("one-pair", f"{marg}", f"{100*marg/ncl:.0f}%")
+                    m3.metric("air (no pair)", f"{bluff}", f"{100*bluff/ncl:.0f}%")
+                    dist = ", ".join(
+                        f"{d1_profiler.CATEGORY_NAMES[i]} {f.get('cat'+str(i), 0)}"
+                        for i in range(8, -1, -1) if f.get(f"cat{i}", 0))
+                    st.caption("Category distribution: " + dist + ". High value% + "
+                               "low air% = the field isn't bluffing these.")
+
+        # ----- Hero loss attribution + patch recommendation (centerpiece) -----
+        with st.expander("Hero loss attribution + patch recommendation",
+                         expanded=bool(hero)):
+            st.caption(
+                "Where your bot bleeds chips, split into patchable buckets, plus "
+                "the river_underbluff_fold EV and a finals recommendation. The "
+                "recommendation defaults to **keep your bot** and only suggests a "
+                "change when its gates clear — and always says to confirm a "
+                "strategy lever on the Tab-3 backtest matrix before shipping."
+            )
+            if st.button("Analyse hero & recommend", key="profiler_hero",
+                         disabled=not has_files, type="primary"):
+                if not hero:
+                    st.warning("Enter your bot id above to attribute its losses. "
+                               "(Without a hero, only a field-only 'keep' "
+                               "recommendation is possible.)")
+                try:
+                    conv = _resolve_conv()
+                    n, agg, net_sum = d1_profiler.profile_chips(
+                        hdir, amount_is_cumulative=conv)
+                    chip_rows = d1_profiler.compute_chip_rows(agg, net_sum)
+                    r_agg, _ = d1_profiler.river_big_bets(
+                        hdir, amount_is_cumulative=conv)
+                    hero_res = (d1_profiler.hero_loss_attribution(
+                        hdir, hero, amount_is_cumulative=conv) if hero else None)
+                    rec = d1_profiler.recommend_patch(
+                        chip_rows, r_agg, hero_res, hero or None, n)
+                    # full CSV bundle, zipped for download
+                    tmp = tempfile.mkdtemp(prefix="d1report_")
+                    try:
+                        d1_profiler.dump_report(
+                            hdir, hero or None, tmp, amount_is_cumulative=conv)
+                        buf = _io.BytesIO()
+                        with _zipfile.ZipFile(buf, "w", _zipfile.ZIP_DEFLATED) as z:
+                            for fp in sorted(Path(tmp).glob("*")):
+                                z.write(fp, arcname=fp.name)
+                        zip_bytes = buf.getvalue()
+                    finally:
+                        shutil.rmtree(tmp, ignore_errors=True)
+                    st.session_state["_d1_report"] = {
+                        "rec": rec, "hero_res": hero_res, "n_hands": n,
+                        "hero": hero, "zip": zip_bytes,
+                        "rec_text": d1_profiler.format_recommendation(rec),
+                    }
+                except Exception as exc:
+                    st.error(f"Hero analysis failed: {exc}")
+                    st.session_state.pop("_d1_report", None)
+
+            # Render from session_state so the download button survives the
+            # rerun a download click triggers.
+            rep = st.session_state.get("_d1_report")
+            if rep:
+                rec = rep["rec"]
+                verdict = rec["recommendation"]
+                conf = rec["confidence"]
+                banner = (f"**{verdict}**  ·  confidence: {conf}"
+                          + ("  ·  ⚠ CROSS-CHECK THE BACKTEST MATRIX"
+                             if rec["cross_check_required"] else ""))
+                if verdict.startswith("PATCH"):
+                    st.error(banner)
+                elif verdict.startswith("CANDIDATE"):
+                    st.warning(banner)
+                else:
+                    st.success(banner)
+                st.markdown("**Why:**")
+                for r in rec["reasons"]:
+                    st.markdown(f"- {r}")
+
+                hres = rep["hero_res"]
+                if hres:
+                    st.markdown(f"**Loss attribution for `{rep['hero']}`** "
+                                f"({hres['hero_hands']} hands, net "
+                                f"{hres['net_total']:+.0f} chips)")
+                    buckets = hres["buckets"]
+                    tot_lost = sum(v["chips"] for v in buckets.values()) or 1
+                    brows = [{
+                        "loss bucket": b,
+                        "hands": v["hands"],
+                        "chips": round(v["chips"]),
+                        "% of losses": round(100 * v["chips"] / tot_lost, 1),
+                    } for b, v in sorted(buckets.items(),
+                                         key=lambda kv: -kv[1]["chips"])]
+                    if brows:
+                        st.dataframe(brows, use_container_width=True,
+                                     hide_index=True)
+                        st.caption(
+                            "Patchable: **fault_marker** (a robustness bug — the "
+                            "highest-value fix) and arguably **value_own** "
+                            "(paying off with weak hands). **cooler** is "
+                            "unavoidable variance, not a leak."
+                        )
+                    ec = hres.get("match_error_count", 0)
+                    if ec:
+                        from collections import Counter as _C
+                        kinds = _C(
+                            (str(e.get("error", e)) if isinstance(e, dict)
+                             else str(e))
+                            for e in hres.get("match_errors", []))
+                        st.error(f"Engine logged **{ec} fault(s)** for "
+                                 f"`{rep['hero']}` ({dict(kinds)}). Each forfeits "
+                                 "the hand — fix robustness first.")
+                    L = hres["lever"]
+                    st.caption(
+                        f"river_underbluff_fold EV on this field: saves ~{L['save']:.0f} "
+                        f"over {L['save_n']} losing calls, costs ~{L['cost']:.0f} over "
+                        f"{L['cost_n']} winning calls → net ~{L['net']:+.0f} chips "
+                        f"({'looks +EV' if L['net'] > 0 else 'not justified here'}). "
+                        "Confirm on the matrix before shipping."
+                    )
+
+                st.download_button(
+                    "⤓ Download full CSV report bundle (.zip)",
+                    data=rep["zip"],
+                    file_name=(f"d1_report_{rep['hero'] or 'field'}.zip"),
+                    mime="application/zip",
+                    key="profiler_dl_report",
+                )
+                with st.expander("Recommendation as text"):
+                    st.code(rep["rec_text"], language="text")
+
+        # ----- Preflop & c-bet profile (count-based, no chips) -----
+        with st.expander("Preflop & c-bet profile (count-based)"):
+            st.caption("Count-based read (no chip reconstruction): adds "
+                       "fold-to-cbet and the CBET-bluffable / CHECK-RAISER / "
+                       "OVER-AGGRESSIVE flags that guide the c-bet and range "
+                       "levers.")
+            if st.button("Profile field", key="profiler_profile",
+                         disabled=not has_files):
                 try:
                     nhands, agg = d1_profiler.profile(hdir)
                 except Exception as exc:
@@ -2426,10 +2758,6 @@ with tab_profiler:
                     )
                 else:
                     rows = d1_profiler.compute_profile_rows(agg)
-
-                    def _pct(x):
-                        return None if x is None else round(100 * x, 1)
-
                     table = [{
                         "opponent": r["opponent"],
                         "hands": r["hands"],
@@ -2454,9 +2782,9 @@ with tab_profiler:
         # ----- Calibrate ranges -----
         with st.expander("Calibrate ranges (range strings from showdowns)"):
             rc1, rc2 = st.columns([2, 1])
-            hero = rc1.text_input(
+            hero_r = rc1.text_input(
                 "Exclude hero seat id (optional)", key="profiler_hero",
-                placeholder="e.g. v7-m2 — blank = whole field",
+                placeholder="e.g. v16_ship — blank = whole field",
                 help="Excludes your own showdowns so the calibrated range "
                      "reflects the field, not you.",
             )
@@ -2470,7 +2798,7 @@ with tab_profiler:
                          disabled=not has_files):
                 try:
                     buckets = d1_profiler.calibrate_ranges(
-                        hdir, hero=(hero.strip() or None),
+                        hdir, hero=(hero_r.strip() or None),
                         min_combos=int(min_combos),
                     )
                 except Exception as exc:

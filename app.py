@@ -2628,7 +2628,7 @@ with tab_profiler:
                 "change when its gates clear — and always says to confirm a "
                 "strategy lever on the Tab-3 backtest matrix before shipping."
             )
-            if st.button("Analyse hero & recommend", key="profiler_hero",
+            if st.button("Analyse hero & recommend", key="profiler_hero_run",
                          disabled=not has_files, type="primary"):
                 if not hero:
                     st.warning("Enter your bot id above to attribute its losses. "

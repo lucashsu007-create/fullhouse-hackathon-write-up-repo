@@ -1,0 +1,231 @@
+Yes. For finals, your plan should be **not “add all tricks,” but build a controlled high-ceiling finals version**.
+
+## Finals priority list
+
+### 1. Keep Pantheon as frozen fallback
+
+Do not delete or mutate the current qualifier bot.
+
+[
+\boxed{\text{Pantheon-stable = emergency fallback}}
+]
+
+Everything else should be in separate files.
+
+---
+
+### 2. Build one finals candidate: `Pantheon-F`
+
+Goal:
+
+[
+\text{increase scoop rate without becoming a punt bot}
+]
+
+Your current bot is good for qualification, but capped because:
+
+[
+\text{fold too much, call too little, scoop too little}
+]
+
+Finals bot needs more continuation and better stack conversion.
+
+---
+
+### 3. Fix overfolding to aggression, but only slightly
+
+Main issue:
+
+[
+\text{tight open range} + \text{high fold-to-pressure}
+]
+
+For finals, add a **small raise-range discount**, not a global loosen-up.
+
+Recommended scale:
+
+[
+\text{villain raise strength} \times= 0.98 \text{ or } 0.99
+]
+
+Only apply it to:
+
+* flop / turn,
+* small or medium raises,
+* loose or high-action opponents,
+* heads-up or simple pots.
+
+Do **not** apply it to:
+
+* river big raises,
+* all-ins,
+* multiway heavy action,
+* passive/nit opponents suddenly raising.
+
+---
+
+### 4. Add river danger discipline
+
+Your bust hands suggest a small real leak:
+
+[
+\text{strong one-pair / overpair} \rightarrow \text{villain keeps betting} \rightarrow \text{dangerous river} \rightarrow \text{payoff}
+]
+
+Add a specific guard for:
+
+* completed flush boards,
+* four-straight boards,
+* paired boards after heavy action,
+* river raise after villain already showed strength.
+
+This should not make you fold sets or premiums blindly. It should mainly protect:
+
+[
+\text{top pair, overpair, second pair, weak kicker top pair}
+]
+
+---
+
+### 5. Add big-stack pot-control mode
+
+This is one of the best finals ideas.
+
+Trigger:
+
+[
+\text{hero stack} \geq 1.5 \times \text{average live stack}
+]
+
+Then:
+
+* reduce thin value raises,
+* call more with medium-strength hands,
+* avoid reopening action with non-nut made hands,
+* still bet and raise very strong hands.
+
+This protects table lead without killing value.
+
+---
+
+### 6. Improve calling, not just raising
+
+Top bots are not just more aggressive. They call more.
+
+Your current call rate is too low. Finals version should move from:
+
+[
+\text{raise/fold}
+]
+
+toward:
+
+[
+\text{raise/call/fold with better thresholds}
+]
+
+Add calls mainly in:
+
+* medium-equity hands versus small bets,
+* bluff-catcher spots versus aggressive opponents,
+* hands with showdown value where raising is too thin.
+
+Do not widen garbage preflop.
+
+---
+
+### 7. Anti-station value mode
+
+If weak bots become bad copycats, they will call too much.
+
+Against high-call, low-raise opponents:
+
+* value bet larger,
+* do not bluff too much,
+* do not over-respect calls,
+* respect rare raises.
+
+Rule:
+
+[
+\text{high call + low raise} = \text{station, value hard, fold to big raise}
+]
+
+---
+
+### 8. Anti-maniac mode
+
+Against high-raise or jam-heavy opponents:
+
+* call down slightly wider with strong bluff-catchers,
+* stop folding every medium-strength hand,
+* but keep all-in discipline.
+
+Rule:
+
+[
+\text{high raise + high all-in} = \text{reduce fold-to-pressure, but do not stack off weak top pair}
+]
+
+---
+
+### 9. Optional sizing jitter
+
+For finals only, test small deterministic sizing jitter.
+
+Use only if A/B is neutral or positive.
+
+Purpose:
+
+[
+\text{reduce hardcoded exploitability}
+]
+
+But do not ship if it changes EV negatively. Sizing changes are not cosmetic.
+
+---
+
+### 10. Do not re-enable board narrowing unless it wins A/B
+
+You already found board narrowing hurt because many bots are board-illiterate.
+
+So default:
+
+[
+\boxed{\text{keep board narrowing disabled}}
+]
+
+Only reconsider if finals opponents are demonstrably more board-aware.
+
+---
+
+## Testing order
+
+Do not test everything at once. Use this order:
+
+[
+\text{Pantheon}
+\rightarrow +\text{tiny raise-range discount}
+\rightarrow +\text{river danger discipline}
+\rightarrow +\text{big-stack mode}
+\rightarrow +\text{anti-station / anti-maniac reads}
+\rightarrow +\text{jitter}
+]
+
+Ship the best A/B winner, not the most complicated bot.
+
+## Final finals objective
+
+Qualifier bot:
+
+[
+\boxed{\text{survive and stay above cutoff}}
+]
+
+Finals bot:
+
+[
+\boxed{\text{scoop more tables without punting big-stack leads}}
+]
+
+Your finals build should be **less scared of pressure**, but **more cautious with non-nut hands in huge river pots**. That is the balance.

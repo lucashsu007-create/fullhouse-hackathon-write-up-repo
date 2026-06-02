@@ -226,10 +226,6 @@ A feature that fires but is flat in its target regime is dropped; a feature that
 
 Never bundle two ideas in one arm — paired batches isolate cleanly only if each variant differs from the baseline by a single change. The V16 *foundation* bundled eight fixes and could not be judged as a unit until it was decomposed into single-component arms, which is how the board-range filter was identified as the sole negative-floor source while the rest were neutral or positive.
 
-### 8. Sandbox limitation
-
-`eval7` (the equity engine) does not build in the development sandbox, so equity-path code could not execute there — only static/scope/crash tests ran locally. All chip-EV numbers were produced on the separate eval7-enabled rig, and final timing must be confirmed on the actual competition hardware (0.5 CPU, 2s/decision). Static safety (`harden_scan.py`), a 6,000-state crash/adversarial fuzz, and a real Python-3.10 import are the pre-submission gates that *can* be run without the rig.
-
 ## Safety
 
 The final candidates were checked for:

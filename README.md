@@ -155,20 +155,80 @@ The bot performs best as a disciplined, range-aware TAG that avoids speculative 
 
 ## Testing Methodology
 
-Testing used paired A/B backtests with shared hand seeds. Candidate quality was judged by paired chip difference, not by raw per-arm confidence intervals.
+All quality decisions came from backtests against a fixed panel of opponent bots, scored in big-blinds-per-100-hands (bb/100) and in raw chip delta. The methodology below is what made small (~1 bb/100) effects measurable and kept the project from shipping changes that merely looked good in noise.
 
-Promotion rule:
+### 1. Paired A/B, shared seeds
+
+Every comparison ran the candidate and the baseline **in the same job on identical seeded hands**. Because both bots see the same cards and the same opponents, hands where they would act identically contribute exactly zero to the difference, and the paired chip delta is the *exact* head-to-head result rather than a difference of two noisy averages.
 
 ```text
-Ship the bot with the best worst-field floor, not the highest mean.
+paired_diff = total_chips(candidate) - total_chips(baseline)   # same hands
 ```
 
-A candidate was promoted only if it avoided meaningful regression across the field panel. Positive average EV was not enough.
+- The per-arm 95% CI reported by the harness measures within-arm bounce and is **irrelevant for A/B decisions** — it is used only for absolute standing (eval-mode runs).
+- "Does it fire / by how much" was always read from the count of nonzero per-match paired entries, never from a summary block (an early harness bug reported two genuinely-different bots as identical in the summary while the truth was in the per-match data).
 
-Two power-related lessons were reinforced empirically:
+### 2. Seed replication for confidence
 
-- **Seeds, not hands-per-match, tighten the verdict.** A floor estimate swung ~3.5 bb/100 between two 3-seed batches on an unchanged bot; 10–40 seeds were required to resolve ~1 bb/100 effects.
-- **Single-hero batches are fake-tight.** Reading "X beats Y" off two separate single-hero runs is unreliable (seed-to-seed stdev ~0.1, an artifact); only paired in-job runs (stdev ~0.9, real variance) are trustworthy for comparisons. The engine is otherwise perfectly deterministic across identical bots (identical-bot paired diff = exactly 0).
+One seed = one exact paired-diff sample. Confidence comes from running **K independent seed bases** and taking the mean and standard error of the per-seed paired diffs.
+
+- **Seeds, not hands-per-match, tighten the verdict.** A floor estimate swung ~3.5 bb/100 between two 3-seed batches on an *unchanged* bot. 3 seeds is not enough to call a floor; 10 seeds resolved most effects, and 40 seeds were used to settle the one borderline field (`exploiter_mix`).
+- SE shrinks as 1/√(seeds). Extra hands-per-match past ~2,500 barely move a paired CI, because beyond saturation the additional hands are mostly spots where the two bots play identically (contributing 0 to the diff). Budget went to seeds, not match length.
+
+### 3. The floor rule (promotion gate)
+
+```text
+Promote a candidate only if its paired-diff CI lower bound is >= 0
+(within a small tolerance) in EVERY field. Highest mean does not promote.
+```
+
+A +2 / −1.5 profile (strong mean, one negative field) was rejected. This asymmetry is deliberate: a top-N cut punishes a bad worst-case far more than it rewards a good average, and every rejected exploit family (V8/V9/V11/V13-lag, the full V16 foundation, `ev_call`) had exactly the strong-mean / negative-floor shape.
+
+### 4. Determinism as a correctness check
+
+The engine is **perfectly deterministic across identical bot instances**: an identical-bot paired diff is exactly 0 chips. This was used as an invariant test for every flag-gated change:
+
+```text
+flag OFF vs base, paired  ->  must be exactly 0 chips
+```
+
+A non-zero result with the flag off proved a real (if tiny) code divergence — used to catch RNG-stream contamination introduced by editing already-modified files. The fix was discipline: build each variant as a single clean edit from a proven-clean source, then re-verify the 0-chip invariant before measuring EV.
+
+- **Single-hero batches are fake-tight.** A bot run alone against a field shows seed-to-seed stdev ~0.1 (the seeds do not decorrelate), producing artificially narrow CIs. Paired in-job runs show stdev ~0.9 (real variance). "X beats Y" was therefore read only off paired runs; differencing two separate single-hero batches smears the small edges and is unreliable.
+
+### 5. Probe + regression methodology (for exploit/leak fixes)
+
+A leak fix or exploit needs **two kinds of field** to be judged:
+
+- a **probe field** containing the target archetype, so the change can demonstrate value, and
+- **regression-control fields** where the baseline already wins, so the change can be shown not to bleed.
+
+A change that beats its probe *and* holds the controls is a real fix the panel was blind to. A change inert on the panel is not necessarily worthless (the panel may lack the target), but a change that helps the probe and hurts a control is rejected. This is why purpose-built sparring opponents exist:
+
+- `perma_allin` / `perma_raiser` — to validate the Tier-1 archetype detector (it gained ~+20–45 bb/100 vs these and was exactly 0 vs all normal fields).
+- `board_aware_tag` — a board-aware opponent built to test whether board-aware ranges help in their target regime (they did not; flat-to-negative).
+- `river_valuebettor` — a low-aggression, big-river-value-only opponent built to test `river_underbluff_fold` (it gained +3.1 bb/100 there and 0 elsewhere).
+
+### 6. Two-regime test (for gated features)
+
+For any feature gated on an opponent read, the pass bar is all four at once:
+
+```text
+1. Invariant : flag OFF == base, exactly 0 chips
+2. Liveness  : flag actually fires (else "flat" is "inert", not "neutral")
+3. Target    : gains in the regime it is built for
+4. Floor     : does not bleed on any realistic field (CI low >= 0)
+```
+
+A feature that fires but is flat in its target regime is dropped; a feature that gains in-target but bleeds a control is dropped. Only features that were costless on normal opponents and positive in their target regime (the Tier-1 detector, `river_underbluff_fold`) were shipped.
+
+### 7. One change per candidate
+
+Never bundle two ideas in one arm — paired batches isolate cleanly only if each variant differs from the baseline by a single change. The V16 *foundation* bundled eight fixes and could not be judged as a unit until it was decomposed into single-component arms, which is how the board-range filter was identified as the sole negative-floor source while the rest were neutral or positive.
+
+### 8. Sandbox limitation
+
+`eval7` (the equity engine) does not build in the development sandbox, so equity-path code could not execute there — only static/scope/crash tests ran locally. All chip-EV numbers were produced on the separate eval7-enabled rig, and final timing must be confirmed on the actual competition hardware (0.5 CPU, 2s/decision). Static safety (`harden_scan.py`), a 6,000-state crash/adversarial fuzz, and a real Python-3.10 import are the pre-submission gates that *can* be run without the rig.
 
 ## Safety
 

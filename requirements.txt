@@ -1,1 +1,9 @@
+# Core poker evaluator used by the engine/backtester
+eval7>=0.1.10
 
+# Dashboard
+streamlit>=1.35.0
+matplotlib>=3.8.0
+
+# Optional but recommended for faster/more reliable statistical tests in analysis.py
+scipy>=1.11.0

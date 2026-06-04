@@ -1,0 +1,9 @@
+{
+  "name": "finalstest",
+  "created_at": "2026-06-04T14:12:58Z",
+  "bot_ids": [
+    "bot_v21_value_accel",
+    "bot_v22_pressure",
+    "bot_v23_meta_counter"
+  ]
+}

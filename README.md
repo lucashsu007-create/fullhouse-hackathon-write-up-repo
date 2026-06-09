@@ -1,22 +1,51 @@
-# Fullhouse Poker Bot Technical Report
+# Fullhouse 2026 Poker Bot Technical Report
 
-## Summary
+## Final Result
 
-This repository documents the development, testing, and final ship decision for a Fullhouse Hackathon poker bot.
+Fullhouse 2026 is complete.
 
-The current finals submission is:
+After qualifying from a field of 500+ participants, this bot finished **5th in the International Championship** at the live finals hosted at **UCL East, London**.
+
+The final submitted bot was:
 
 ```text
 v16_squeeze_C_metacap
 ```
 
-This is a conservative finals patch built on the validated `v16` / `v16_noranges` family. It keeps the proven aggressive baseline, keeps board-aware range narrowing disabled, and adds only small, cliff-gated value/capped-line punishers that showed no regression in the final confirmation sweeps.
+The main lesson from the project was that **optimizing for robustness** and **optimizing for a specific competitive environment** are often different problems. Many ideas that were theoretically attractive, including broader board-aware range narrowing and general defensive leak filters, reduced empirical performance in the actual testing regime. The final bot therefore stayed close to the validated aggressive core and accepted only narrow, well-tested changes.
+
+Congratulations to **Emile Andrieu** for winning the International Championship.
+
+## Project Summary
+
+This repository documents the development, testing, and final ship decision for a Fullhouse Hackathon poker bot.
+
+The project was approached as a quantitative research problem rather than only as an autonomous poker-agent build. The core work consisted of:
+
+- building a reproducible experimentation pipeline;
+- designing custom opponent panels;
+- running paired A/B tests with shared seeds;
+- using common-random-number variance reduction;
+- evaluating candidates with bb/100, chip delta, win rate, bust rate, first-place rate, paired tests, bootstrap confidence intervals, and floor checks;
+- rejecting features that looked promising theoretically but failed empirical validation.
+
+Over the course of the competition, the project evaluated more than **10 million simulated hands**, developed over **100 agent variants**, and built a library of **30+ custom opponent models** for training and evaluation.
+
+## Final Bot
+
+Final submission:
+
+```text
+v16_squeeze_C_metacap
+```
+
+This was a conservative finals patch built on the validated `v16` / `v16_noranges` family. It kept the proven aggressive baseline, kept board-aware range narrowing disabled, and added only small, cliff-gated value and capped-line punishers that showed no regression in final confirmation sweeps.
 
 Final fallback hierarchy:
 
 | Role | Bot |
 |---|---|
-| Recommended finals ship | `v16_squeeze_C_metacap` |
+| Final live submission | `v16_squeeze_C_metacap` |
 | Cleanest low-complexity fallback | `v16_posfix_nutvalue` |
 | Original live baseline | `v16_ship` |
 | Ultra-safe fallback | `V7-M2 (fix)` |
@@ -45,11 +74,32 @@ _V16_FLAGS = {
 }
 ```
 
-## Qualifier 1 Result (LIVE)
+## Live Competition Results
 
-Submitted `v16_ship` to the live Fullhouse 2026 qualifier. The bot qualified for the finals.
+### Qualification
 
-A later live ranking context from this chat placed `v16_ship` around **rank 28 / 64 total**, so the finals patch work should be interpreted as an attempt to move a qualified but not favorite-tier bot into the contender band, not as proof that the bot is already the strongest in the field.
+Submitted `v16_ship` to the live Fullhouse 2026 qualifier. The bot qualified for the finals from a field of **500+ participants**.
+
+Live qualification context:
+
+| Result | Value |
+|---|---:|
+| Overall qualifier rank context | around 28 / 64 finalists |
+| Dutch finalists | one of two |
+| Non-UK finalist context | top 6 |
+| Qualification-stage match win-rate context | top 6 overall |
+
+The qualifier result showed that the bot was clearly competitive, but not the field favorite. The finals patch work should therefore be interpreted as an attempt to move a qualified but not favorite-tier bot into the contender band, not as proof that the bot was already the strongest in the field.
+
+### Finals
+
+At the live finals at **UCL East, London**, the bot finished:
+
+```text
+5th in the International Championship
+```
+
+This result validated the broad project direction: a robust, empirically tested, value-heavy strategy was strong enough to survive the live environment, but the final ranking also reinforced that overfitting to the wrong opponent model, or optimizing the wrong robustness criterion, can leave performance on the table.
 
 ## Qualifier II / Finals Hand-History Findings
 
@@ -108,10 +158,10 @@ The bot's edge comes from fast chip accumulation, not survival.
 
 The real leak buckets were narrower:
 
-- Top pair in huge pots.
-- Fake two pair on paired boards.
-- Low flushes on dangerous flush boards.
-- Sets or trips on boards where straights completed.
+- top pair in huge pots;
+- fake two pair on paired boards;
+- low flushes on dangerous flush boards;
+- sets or trips on boards where straights completed.
 
 However, later tests showed that even narrow fake-strength filters reduced EV, because the bad spots were rare and the filters interfered with normal profitable aggression.
 
@@ -134,7 +184,7 @@ However, later tests showed that even narrow fake-strength filters reduced EV, b
 | `v16_ship` | `v16_noranges` plus low-cost insurance features | Qualified, later used as baseline |
 | `v16_posfix_nutvalue` | `v16_ship` plus postflop position fix and nut-region value sizing | Best clean upgrade |
 | `v16_squeeze_C_AA_KK_QQ_AKs` | Adds premium squeeze with AA/KK/QQ/AKs, no size tweak | Slight raw gain, mostly identical to posfix |
-| `v16_squeeze_C_metacap` | Adds premium squeeze plus capped-line punishers | Current finals ship |
+| `v16_squeeze_C_metacap` | Adds premium squeeze plus capped-line punishers | Final live submission |
 
 ## Key Technical Fixes and Findings
 
@@ -262,7 +312,7 @@ A 30-job, 750-match sweep showed all four versions exactly equal in realized chi
 C_metacap = blockstraight = tightdonk = tightminraise
 ```
 
-Therefore the cleanest file remains `v16_squeeze_C_metacap`.
+Therefore the cleanest file remained `v16_squeeze_C_metacap`.
 
 ## Final Validation Results
 
@@ -322,7 +372,7 @@ nit_field: tied
 barrel_field: tied / best
 ```
 
-This clears the final ship rule:
+This cleared the final ship rule:
 
 ```text
 Ship C_metacap if it beats v16_ship,
@@ -333,7 +383,7 @@ and remains at least tied with posfix_nutvalue.
 
 ## Strategic Finding
 
-The repeated result is:
+The repeated result was:
 
 ```text
 Correctness-style improvements are robust.
@@ -343,7 +393,7 @@ The bot wins by fast value-heavy chip accumulation, not by survival.
 Small capped-line punishers are acceptable only if they are rare and do not alter normal aggression.
 ```
 
-The final bot remains close to the proven `v16` core. The accepted changes are intentionally small:
+The final bot remained close to the proven `v16` core. The accepted changes were intentionally small:
 
 ```text
 postflop position fix
@@ -352,6 +402,8 @@ premium squeeze C
 rare capped-line punishers
 raise sanitizer guard
 ```
+
+The live finals result refined this conclusion rather than replacing it. The project did not show that simple robustness is always optimal. It showed that in a noisy multi-agent competition, robustness needs to be defined against the correct target distribution. A bot can be robust in backtests and still be suboptimal if the evaluation population shifts.
 
 ## Testing Methodology
 
@@ -373,7 +425,7 @@ Confidence came from independent seed bases, not from only increasing hands per 
 
 ### 3. Floor rule
 
-A candidate is only promoted if it does not create a negative floor in important control fields.
+A candidate was only promoted if it did not create a negative floor in important control fields.
 
 ```text
 Highest mean alone is not enough.
@@ -412,15 +464,21 @@ python3 -m py_compile bot.py
 python3 harden_scan.py bot.py
 ```
 
-## Final Ship Decision
+## Final Retrospective
 
-Submit:
+Final submission:
 
 ```text
 v16_squeeze_C_metacap
 ```
 
-Reason:
+Final result:
+
+```text
+5th in the Fullhouse 2026 International Championship
+```
+
+Why this bot shipped:
 
 ```text
 v16_squeeze_C_metacap
@@ -432,22 +490,15 @@ v16_squeeze_C_metacap
 + sanitizer guard
 ```
 
-It is the best current finals candidate because it:
+It was the best available finals candidate because it:
 
 ```text
-beats v16_ship clearly,
-is directionally ahead of v16_posfix_nutvalue,
-does not lose wall_balanced,
-does not lose barrel_field,
-has 0 errors in final confirmation sweeps,
-and keeps all previously rejected broad overlays disabled.
+beat v16_ship clearly,
+was directionally ahead of v16_posfix_nutvalue,
+did not lose wall_balanced,
+did not lose barrel_field,
+had 0 errors in final confirmation sweeps,
+and kept all previously rejected broad overlays disabled.
 ```
 
-Fallback order:
-
-```text
-1. v16_squeeze_C_metacap
-2. v16_posfix_nutvalue
-3. v16_ship
-4. V7-M2 (fix)
-```
+The final standing was a strong result, but the more useful research takeaway is methodological: empirical validation beats theory-only patching, but the validation environment must match the live target distribution as closely as possible.

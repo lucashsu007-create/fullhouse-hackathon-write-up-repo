@@ -91,10 +91,26 @@ class Extraction(unittest.TestCase):
         (item,) = blocks(page("<ul><li><p>Equity, mezzanine, vendor and equipment-linked finance.</p></li></ul>", "en"))
         self.assertEqual(item.role, "li")
 
-    def test_numbered_kickers_are_counted_not_extracted(self):
-        found, info = ca.blocks_from_html(page("<span>01</span><h2>Menu</h2><span>02</span><h2>Prijzen</h2>"), "t")
+    def test_numbered_kickers_are_counted_bare_or_fused_with_a_label(self):
+        found, info = ca.blocks_from_html(
+            page("<span>01</span><h2>Menu</h2><span>02 de sfeer</span><h2>Prijzen</h2><p>MCHI / 03</p>"), "t")
         self.assertEqual(info["kickers"], 2)
-        self.assertNotIn("01", [b.text for b in found])
+        self.assertEqual([(b.role, b.text) for b in found if b.text.startswith("0")],
+                         [("kicker", "01"), ("text", "02 de sfeer")])
+
+    def test_lines_without_letters_stay_unless_they_are_icons(self):
+        got = blocks(page("<p>020 123 4567</p><p>17:00 - 22:15</p><span>\u2197</span><button>\u2192</button>"))
+        self.assertEqual([b.text for b in got], ["020 123 4567", "17:00 - 22:15"])
+
+    def test_aria_hidden_content_is_shown_as_decor_and_never_checked(self):
+        html = page('<div aria-hidden="true"><label>Ontdek onze website</label></div><p>Echte tekst hier.</p>')
+        self.assertEqual([(b.role, b.text) for b in blocks(html)][0], ("decor", "Ontdek onze website"))
+        self.assertNotIn("stock", flagged(html))
+
+    def test_social_image_alt_is_alt_text(self):
+        head = '<meta property="og:image:alt" content="Het logo op een donkere achtergrond">'
+        self.assertEqual([(b.role, b.text) for b in blocks(page("", head=head))],
+                         [("alt", "Het logo op een donkere achtergrond")])
 
     def test_language_comes_from_the_page_and_is_refined_per_block(self):
         html = page("<p>Wij zijn elke dag open en de keuken sluit om tien uur.</p><p lang=\"en\">Open every day.</p>"
@@ -164,15 +180,30 @@ class BlockChecks(unittest.TestCase):
                            "<p>We are open every day from 13:00. The kitchen closes at 22:30.</p>", "en"))
         self.assertEqual(got["staccato"], ["Few get in. The screen runs both ways."])
 
-    def test_colon_setup_but_not_labels_or_times(self):
-        got = flagged(page("<p>Sushi, sashimi, teppanyaki, wok en grill: meer dan honderd gerechten.</p>"
+    def test_colon_setups_as_a_habit_but_not_labels_or_times(self):
+        setups = ["Sushi, sashimi, teppanyaki, wok en grill: meer dan honderd gerechten.",
+                  "Kijk even binnen: acht beelden uit onze eetzaal."]
+        got = flagged(page("".join(f"<p>{s}</p>" for s in setups) +
                            "<p>E-mail: info@example.org</p><p>Open vanaf 17:00 op zondag en maandag.</p>"))
-        self.assertEqual(got["colon"], ["Sushi, sashimi, teppanyaki, wok en grill: meer dan honderd gerechten."])
+        self.assertEqual(got["colon"], setups)
+
+    def test_a_single_colon_setup_is_not_reported(self):
+        self.assertNotIn("colon", flagged(page("<p>Sushi, sashimi, wok en grill: meer dan honderd gerechten.</p>")))
 
     def test_triad_in_short_display_lines_not_in_lists(self):
         got = flagged(page("<p>Een avond vol smaak, vuur en verrassingen.</p>"
                            "<ul><li>Tonijn, zalm en sint-jakobsschelp.</li></ul>"))
         self.assertEqual(got["triad"], ["Een avond vol smaak, vuur en verrassingen."])
+
+    def test_triad_is_found_inside_a_longer_paragraph(self):
+        para = ("Een avond vol smaak, vuur en verrassingen. Van sushi en sashimi tot gerechten "
+                "met een eigen twist van de chef.")
+        self.assertEqual(flagged(page(f"<p>{para}</p>"))["triad"], [para])
+
+    def test_a_question_followed_by_a_link_label_is_not_clipped(self):
+        got = flagged(page('<p>Zin gekregen? <a href="/menu">Bekijk de kaart</a></p>'
+                           "<p>Thank you. It has been sent.</p>"))
+        self.assertEqual(got.get("staccato"), ["Thank you. It has been sent."])
 
     def test_dutch_fronted_clause_but_not_a_real_question(self):
         got = flagged(page("<p>Welke tijden u per dag kunt reserveren, ziet u in het reserveringssysteem.</p>"
@@ -200,7 +231,7 @@ class BlockChecks(unittest.TestCase):
         dossier = ("Metro 52 stopt op vier minuten lopen. Vanaf Centraal is dat drie haltes. "
                    "Tram 1, 7 en 19 en nachtbus N82 stoppen ook.")
         got = flagged(page(f"<p>{dossier}</p><h2>Zestien gerechten van de plaat</h2><h3>36 Unagi</h3>"
-                           "<p>Bel 020 123 4567 of reserveer online.</p>"))
+                           "<h3>Four Seasons of Mochi</h3><p>Bel 020 123 4567 of reserveer online.</p>"))
         self.assertEqual(got["figures"], [dossier, "Zestien gerechten van de plaat"])
 
 
@@ -215,6 +246,25 @@ class PageChecks(unittest.TestCase):
         heads = report(page(body))["headings"]
         self.assertEqual((len(heads["ending_in_full_stop"]), len(heads["set_over_lines"]), heads["numbered_kickers"]), (4, 4, 4))
         self.assertIn("heading shape", ca.render_scan(report(page(body))))
+
+    def test_eyebrows_above_headings_are_counted(self):
+        body = ("<p>Van de kaart</p><h2>Favorieten</h2><p>Praktisch</p><h2>Tot straks</h2>"
+                "<p>Vanavond nog?</p><h2>Reserveren</h2><p>Dit is een gewone zin.</p><h2>Contact</h2>")
+        self.assertEqual(report(page(body))["headings"]["eyebrows"], 3)
+
+    def test_captions_and_labels_do_not_count_as_sentences(self):
+        labels = "".join(f"<figure><figcaption>Warm licht {i}</figcaption></figure><p>Elke dag open</p>"
+                         for i in range(10))
+        self.assertEqual(report(page(labels + "<p>We zijn er elke avond vanaf vijf uur, ook op zondag.</p>"))
+                         ["rhythm"]["sentences"], 1)
+
+    def test_locked_lines_are_counted_but_not_flagged(self):
+        html = page("<p>Nothing on this website is an offer or investment advice.</p>"
+                    "<p>No firm is named here, and both sides are checked.</p>", "en")
+        found, info = ca.blocks_from_html(html, "t.html")
+        got = ca.analyse("t.html", found, info, locked=("nothing on this website",))
+        self.assertEqual([f["text"] for f in got["findings"]], ["No firm is named here, and both sides are checked."])
+        self.assertEqual(got["locked_blocks"], 1)
 
     def test_clipped_rhythm_is_noted_and_varied_rhythm_is_not(self):
         clipped = "".join(f"<p>{s}</p>" for s in [
@@ -259,6 +309,14 @@ class Cli(unittest.TestCase):
 
     def test_missing_input_exits_2(self):
         self.assertEqual(self.run_cli("scan", "/no/such/page.html")[0], 2)
+
+    def test_locked_file_on_the_command_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            html, locked = Path(tmp) / "p.html", Path(tmp) / "locked.txt"
+            html.write_text(page("<p>Ontdek de kaart in het hart van de stad.</p>"), encoding="utf-8")
+            locked.write_text("# owner-approved wording\nin het hart van de stad\n", encoding="utf-8")
+            code, text = self.run_cli("scan", "--json", "--locked", str(locked), str(html))
+            self.assertEqual((code, json.loads(text)[0]["findings"], json.loads(text)[0]["locked_blocks"]), (0, [], 1))
 
 
 if __name__ == "__main__":

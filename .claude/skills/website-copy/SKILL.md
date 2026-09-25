@@ -33,7 +33,9 @@ clipped fragments, stiff word order, slogans, and the page talking about itself.
 **The visitor test.** Does the line answer something a visitor wants to know,
 at this point on the page? If not, it goes: to the build notes, to a second
 page, or nowhere. True is necessary, not sufficient. This catches inventory,
-repetition and too much text.
+repetition and too much text. It is a test for facts, not for personality: the
+one thing only this business has (a running joke, a house story, a strange
+dish) stays even though no visitor asked for it.
 
 **The swap test.** Put a competitor's name in. Is the line still true? "Een
 avond vol smaak, vuur en verrassingen" is true of every restaurant in town, so
@@ -54,12 +56,19 @@ Note:
 - the words they use for their own things (*de kaart* or *het menu*, *clients*
   or *partners*);
 - anything with personality: a dish they're proud of, a joke, a phrase regulars
-  repeat in reviews.
+  repeat in reviews;
+- in English: contractions or not, British or American spelling, and *we* or
+  *I* when one named person runs the firm.
 
 Reuse the owner's good lines as they are. Fix typos, keep the idiom. If the
 evidence is thin (a site whose only *je* is in a job ad), choose deliberately,
-write the choice down, and put it on the owner's list. Research tells you how
-to write, not what to paste: a review count or a reply rate is not copy.
+write the choice down, and put it on the owner's list. When the owner can't be
+asked, the evidence is what they wrote: quotes in the project notes, other pages
+of the same site. Where there's little of it, plain beats invented.
+
+Research tells you how to write, not what to paste. An internal metric (a reply
+rate, a follower count) is never copy; a public rating the owner chose to show
+can be.
 
 ### 2. List the visitor's questions, in order
 
@@ -82,7 +91,9 @@ lands, and a page of short ones reads like a telegram.
 
 Shorter is usually better, but cut by removing what the visitor doesn't need,
 not by compressing sentences. Four hundred words in full sentences read better
-than four hundred words of fragments.
+than four hundred words of fragments. If the owner has asked for less text, hold
+the word count: pay for every line you lengthen with a cut elsewhere, and report
+the count before and after.
 
 ### 4. Headings and page furniture
 
@@ -103,19 +114,46 @@ two fragments trades one tic for another. Leave lines that already work alone.
 Churn is not improvement, and some lines carry coupled edits (a changed `<h1>`
 can mean re-rendering a social card; check the project's notes).
 
+## When the project has rules of its own
+
+Projects here keep their own notes (`CLAUDE.md`, `BUILD-NOTES.md`,
+`GUARDRAILS.md`), and they win over this skill:
+
+- **Facts, legal wording, locked text, banned characters**: binding, always.
+- **Voice and taste**: binding too. A rule like "atmosphere is the product,
+  never cut personality" beats the visitor test.
+- **A style rule that causes the robotic tone** (say, "one idea per
+  sentence"): don't silently obey it and don't silently break it. Write the
+  rewrite within the rule, then add two or three lines showing what the rule's
+  removal would buy, as a proposal for the owner.
+- **Structure**: a copy pass works inside the existing markup. Turning a list
+  into prose, dropping kickers or eyebrows, merging a name card into a
+  sentence, or removing markers the design uses is a design change. Hand it
+  back as a question, with a copy-only fallback.
+- **Coupled edits**: a line often lives in more than one place. Nav labels and
+  footers repeat across pages, legal lines are mirrored on the legal pages,
+  and a bilingual site keeps each string twice (and sometimes both in the HTML
+  and in a script's dictionary). Search the whole site before changing a line,
+  and read any HTML comment next to it.
+
 ## Keep it true
 
 Human doesn't mean invented. Don't add stories, family recipes, founding years,
 "loved by locals", chef's picks, quotes or numbers the sources don't support.
-Claims hide in headings too: "Favorieten van de chef" says a chef chose those
-dishes. Warmth comes from voice and true details, not from made-up ones.
+Claims hide in headings and labels too: "Favorieten van de chef", or a filter tab
+called *Favorieten*, says a chef chose those dishes. Watch small shifts of
+meaning when you rephrase: "de smaken van Korea" (the flavours of) is not
+"gerechten uit Korea" (dishes from), and a menu with no Korean dish makes the
+second one false. Warmth comes from voice and true details, not made-up ones.
 
 **Locked text** stays word for word unless the owner (or their lawyer) approves
 a change: legal and regulatory lines, required disclosures (labels for
-AI-generated media, the imprint, a regulatory boundary note), prices and hours,
-and anything a project's notes mark as verbatim. Find these before editing, in
-the project's `CLAUDE.md`, `BUILD-NOTES.md` or `GUARDRAILS.md`. If a locked
-line reads badly, propose a rewrite as a question for the owner; don't apply it.
+AI-generated media, the imprint, a regulatory boundary note), and anything a
+project's notes mark as verbatim. For prices and hours, the figures are locked:
+a sentence around them may be reworded if every value stays identical, and the
+change goes on the owner's list. Find locked text before editing, in the
+project's notes and in HTML comments beside the line. If a locked line reads
+badly, propose a rewrite as a question for the owner; don't apply it.
 
 House rules still apply. Some projects ban the em dash in customer-facing copy.
 Rewrite the sentence; don't swap the dash for a full stop and leave two
@@ -139,8 +177,9 @@ first. `references/examples.md` shows each one fixed on a real page.
   visitor.
 - The same explanation twice. The phone number and the booking button may
   repeat; explanations shouldn't.
-- A checklist pasted in as copy. Show care by naming the two or three checks
-  that matter; the rest is for the conversation.
+- A checklist pasted in as copy. Make each item plain and cut the ones that
+  belong in the conversation; turning the list into prose is a design question
+  (see "When the project has rules of its own").
 - Narrating the photos: "Binnen vindt u marmer onder warme ledlijnen, rotan
   lampen boven de tafels..." The photo already says it.
 
@@ -192,8 +231,10 @@ night-bus numbers.
 Say what you do in your clients' words. Industry terms are fine when the reader
 uses them (an energy developer knows EPC and COD); don't explain what they
 know, and don't stack terms to sound serious. Show you're careful through a few
-concrete specifics, not a published checklist or a compliance voice.
-Regulatory lines stay exact, said once, plainly.
+concrete specifics, not a compliance voice. Regulatory lines stay exact, said
+once, plainly. Verbs can claim regulated activity on their own (*arrange,
+advise, manage, structure your deal*): check every service verb against what the
+firm is allowed to do.
 
 **Bilingual sites.** Write each language natively; don't translate line by
 line. A slogan that's weak in Dutch gets weaker as a calque ("Asian fusion, met
@@ -221,13 +262,20 @@ python3 <skill-dir>/scripts/copy_audit.py scan <same inputs>     # add --json fo
 - `scan` flags likely tells per block, then reports repeated sentences, heading
   shapes and sentence rhythm.
 - Static HTML scans directly. For a framework site, scan the built HTML
-  (`dist/`, `out/`, `.next/server/app/`) or the dev server's URL. Copy that
-  JavaScript injects, such as a language toggle's dictionary, isn't in the
-  HTML: scan the rendered URL or read the dictionary.
+  (`dist/`, `out/`, `.next/server/app/`) or the dev server's URL.
+- A URL is fetched without running JavaScript, so copy a script injects (a
+  language toggle's dictionary, a menu, form success and error messages) is
+  missing. Save the rendered page from a browser and scan that file, or read
+  the script's strings directly.
+- `--locked FILE` takes the lines the project keeps word for word, one
+  substring per line. Those blocks are still extracted but never flagged, so the
+  scan doesn't invite the one edit the project forbids.
 
 It is a flashlight, not a linter. Many flags are fine on a second read, and a
-clean scan proves nothing. Never edit to make a flag go away; rewrite from the
-visitor's question and read it aloud. Its tests:
+clean scan proves nothing: it can't see a lone fragment ("A clear role."), an
+unsupported claim ("Een geliefde plek") or a line that repeats the page's own
+placeholder. That is what the three tests are for. Never edit to make a flag
+go away; rewrite from the visitor's question and read it aloud. Its tests:
 `python3 <skill-dir>/scripts/test_copy_audit.py`.
 
 ## What to hand back
@@ -239,11 +287,17 @@ line by line:
    visitor's question or the test the old line failed.
 2. **Facts taken off the page**, and where they went (for example
    `BUILD-NOTES.md`), so the owner is never surprised.
-3. **Locked text**, listed and untouched. Proposed rewrites of locked lines are
+3. **Claims removed as unsupported**, listed on their own. The owner may have
+   the evidence you couldn't find.
+4. **Changes beyond the words**: markup or layout a line needs, and every other
+   place the same string lives (other pages, the other language, a script).
+5. **Locked text**, listed and untouched. Proposed rewrites of locked lines are
    marked as needing the owner's OK.
-4. **Questions for the owner**: *je* or *u*, and anything you inferred rather
+6. **Questions for the owner**: *je* or *u*, and anything you inferred rather
    than read.
-5. **The scan before and after**, briefly. Don't chase the numbers.
+7. **Word count and scan, before and after**, briefly. Don't chase the numbers.
 
 Read `references/examples.md` before the first rewrite in a session: real
-before-and-after pairs, Dutch and English, restaurant and B2B.
+before-and-after pairs, Dutch and English, restaurant and B2B. They show a
+method, not lines to reuse: check any rewrite against the whole page, because
+the same words can repeat a nearby line or say more than your sources do.

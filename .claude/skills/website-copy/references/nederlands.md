@@ -94,6 +94,10 @@ section rather than one per sentence.
 - Times: *17:00* is clearest in an opening-hours block; in a sentence, *vanaf
   vijf uur* can sound friendlier. Pick one style per page.
 - Prices: *EUR 2,30* or the euro sign with a decimal comma. Follow the menu.
+- Ratings: a bare "4,6" reads as a school mark out of ten, and a failing one.
+  Write "4,6 van de 5 sterren", with a decimal comma here too.
+- Places take the preposition locals use: *op IJburg*, *in De Pijp*, *aan het
+  plein*. Pick one per place and keep it across the page.
 
 ## English on a Dutch site
 

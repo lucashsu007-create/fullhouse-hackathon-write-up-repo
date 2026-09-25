@@ -13,8 +13,14 @@ Stdlib only, so it runs wherever the skill does. Every flag is a reason to
 reread a sentence, not an error: plenty of flagged lines are fine, and a page
 with no flags can still read like a machine wrote it. Read it aloud either way.
 
-Copy that JavaScript injects (a language toggle's dictionary, a client-rendered
-app) is not in the HTML. Scan the rendered page by URL, or the dictionary.
+A URL is fetched as raw HTML and no JavaScript runs, so copy a script injects
+(a language toggle's dictionary, a menu, form success and error messages) is
+not seen. Save the rendered page from a browser and scan that file, or read the
+script's strings.
+
+--locked FILE names lines the project keeps word for word (legal, regulatory,
+required disclosures): one substring per line, '#' for comments. Blocks that
+contain one are still extracted and counted, but never flagged.
 """
 
 from __future__ import annotations
@@ -168,8 +174,12 @@ _ROLE_OF = {
     "th": "cell",
     "title": "title",
 }
-_META_KEYS = frozenset({"description", "og:title", "og:description", "twitter:title", "twitter:description"})
-_KICKER = re.compile(r"0\d")  # the "01", "02" numbers a template puts above each section
+_META_KEYS = frozenset(
+    {"description", "og:title", "og:description", "og:image:alt", "twitter:title", "twitter:description", "twitter:image:alt"}
+)
+# The "01", "02" a template puts above each section, alone or fused with its label ("01 de sfeer").
+_KICKER = re.compile(r"0\d")
+_KICKER_LABEL = re.compile(r"0\d\s+[^\W\d_][\w'-]*(?:\s+[\w'-]+){0,2}")
 
 
 class _PageParser(HTMLParser):
@@ -179,7 +189,7 @@ class _PageParser(HTMLParser):
         self.blocks: list[Block] = []
         self.page_lang = ""
         self.kickers = 0
-        self._stack: list[tuple[str, str]] = []  # (tag, its lang attribute)
+        self._stack: list[tuple[str, str, bool]] = []  # (tag, its lang attribute, aria-hidden)
         self._skip: list[str] = []  # open tags whose content is not shown
         self._buf: list[str] = []
         self._line = 0
@@ -188,7 +198,7 @@ class _PageParser(HTMLParser):
         self._after_close = False  # the last event closed an inline element
 
     def _lang(self) -> str:
-        for _, lang in reversed(self._stack):
+        for _, lang, _ in reversed(self._stack):
             if lang:
                 return lang
         return self.page_lang
@@ -197,23 +207,27 @@ class _PageParser(HTMLParser):
         text = " ".join(text.split())
         if not text:
             return
-        if not _HAS_LETTER.search(text):  # arrows, counters, bare numbers
-            if _KICKER.fullmatch(text):
-                self.kickers += 1
-            return
+        if _KICKER.fullmatch(text) or _KICKER_LABEL.fullmatch(text):
+            self.kickers += 1
+            if not _HAS_LETTER.search(text):
+                role = "kicker"
+        elif not _HAS_LETTER.search(text) and not re.search(r"\d", text):
+            return  # arrows and icons; phone numbers and opening hours stay
         self.blocks.append(Block(role, text, self._lang(), splits, f"{self.source}:{line}"))
 
     def _flush(self) -> None:
         if self._buf:
             role = "text"
-            for tag, _ in reversed(self._stack):
+            for tag, _, _ in reversed(self._stack):
                 if tag in _ROLE_OF:
                     role = _ROLE_OF[tag]
                     break
-            if role in ("p", "text") and any(t == "li" for t, _ in self._stack):
+            if role in ("p", "text") and any(t == "li" for t, _, _ in self._stack):
                 role = "li"  # a paragraph inside a list item is still list content
             if self._all_link and role not in HEADINGS and role not in ("button", "title"):
                 role = "link"
+            if any(hidden for _, _, hidden in self._stack):
+                role = "decor"  # aria-hidden: icons, honeypot fields; shown in extract, never checked
             self._emit(role, "".join(self._buf), self._line, self._splits)
         self._buf, self._all_link, self._splits = [], True, 0
 
@@ -233,10 +247,10 @@ class _PageParser(HTMLParser):
         if tag == "meta":
             key = (a.get("name") or a.get("property") or "").lower()
             if key in _META_KEYS and a.get("content"):
-                self._emit("meta", a["content"], line)
+                self._emit("alt" if key.endswith(":alt") else "meta", a["content"], line)
             return
         if tag == "br":
-            if any(t in HEADINGS for t, _ in self._stack):
+            if any(t in HEADINGS for t, _, _ in self._stack):
                 self._splits += 1
                 self._buf.append(" ")
             else:
@@ -258,7 +272,7 @@ class _PageParser(HTMLParser):
         if tag == "input" and a.get("type", "").lower() in ("submit", "button") and a.get("value"):
             self._emit("button", a["value"], line)
         if tag not in _VOID_TAGS:
-            self._stack.append((tag, _norm_lang(a.get("lang", ""))))
+            self._stack.append((tag, _norm_lang(a.get("lang", "")), a.get("aria-hidden", "").lower() == "true"))
 
     def handle_endtag(self, tag):
         if self._skip:
@@ -279,7 +293,7 @@ class _PageParser(HTMLParser):
         if data.strip():
             if not "".join(self._buf).strip():
                 self._line = self.getpos()[0]
-            if all(t != "a" for t, _ in self._stack):
+            if all(t != "a" for t, _, _ in self._stack):
                 self._all_link = False
             self._after_close = False  # "</em>-twist" continues the same word
         self._buf.append(data)
@@ -599,7 +613,7 @@ CHECKS = {
     ),
     "colon": (
         "colon setup",
-        "'X, Y and Z: the point.' One on a page is fine; one per section is a pattern.",
+        "'X, Y and Z: the point.' One on a page is fine; this page leans on them.",
     ),
     "dash": (
         "dash joint",
@@ -618,8 +632,9 @@ CHECKS = {
 }
 
 RHYTHM_NOTES = {
-    "clipped": "Short, even sentences. If this came out of a cutting pass it may read clipped: join ideas that "
-    "belong together with because, so, but (omdat, dus, maar), and let some sentences run longer.",
+    "clipped": "Short, even sentences. Right for a menu or an opening-hours block; in running prose it reads "
+    "clipped. If a cutting pass did this, join ideas that belong together with because, so, but (omdat, dus, "
+    "maar), and let some sentences run longer.",
     "long": "Sentences run long. Split where a reader would take a breath.",
     "even": "Sentence lengths barely vary. Mix a few short ones in with longer ones.",
 }
@@ -661,13 +676,13 @@ def check_block(b: Block) -> list[Finding]:
         figures = _FIGURE.findall(text)
         if len(figures) >= 5:
             add("figures", f"{len(figures)} figures")
-    elif b.role in ("h1", "h2", "h3") and _COUNTING_HEAD.match(text):
+    elif b.role in ("h1", "h2") and _COUNTING_HEAD.match(text):  # "Four Seasons of Mochi" is a dish
         add("figures", "heading that counts")
 
     if prose or display:
         parts = sentences(text)
-        if len(parts) >= 2 and any(
-            len(words(x)) <= 5 and len(words(y)) <= 5 for x, y in zip(parts, parts[1:])
+        if len(parts) >= 2 and any(  # "Zin gekregen? Bekijk de kaart" is a question and a label, not clipped
+            x.endswith(".") and len(words(x)) <= 5 and len(words(y)) <= 5 for x, y in zip(parts, parts[1:])
         ):
             add("staccato")
         if lang == "nl":
@@ -683,8 +698,9 @@ def check_block(b: Block) -> list[Finding]:
                 add("colon")
                 break
 
-    if (display or (b.role in ("p", "text", "msg") and len(words(text)) <= 14)) and _TRIAD.search(text):
-        add("triad")
+    if display or b.role in ("p", "text", "msg"):  # list items are lists: ingredients, services
+        if any(len(words(s)) <= 12 and _TRIAD.search(s) for s in sentences(text)):
+            add("triad")
 
     if lang == "nl" and (b.role in HEADINGS or b.role in ("button", "link")):
         names = re.findall(r"[^\W\d_][\w'\u2019-]*", text)
@@ -710,12 +726,11 @@ def check_block(b: Block) -> list[Finding]:
 
 
 def _is_running(b: Block) -> bool:
-    """Sentences that count toward rhythm: prose, but not bare labels."""
-    if b.role not in PROSE:
+    """Sentences that count toward rhythm: prose, not captions, eyebrows or labels."""
+    if b.role not in PROSE or b.role == "caption":
         return False
     n = len(words(b.text))
-    ends = b.text.rstrip().endswith((".", "!", "?"))
-    return (ends or n >= 8) if b.role == "li" else (ends or n >= 4)
+    return (b.text.rstrip().endswith((".", "!", "?")) and n >= 3) or n >= 8
 
 
 def rhythm(lengths: list[int]) -> dict:
@@ -759,8 +774,22 @@ def repeats(blocks: list[Block]) -> list[dict]:
     return [e for e in seen.values() if e["count"] >= 2]
 
 
-def analyse(source: str, blocks: list[Block], info: dict) -> dict:
-    findings = [f for b in blocks for f in check_block(b)]
+def _eyebrows(blocks: list[Block]) -> int:
+    """Short labels set straight above a heading ("Prijzen" over "Wat kost het?")."""
+    visible = [b for b in blocks if b.role not in ("alt", "aria", "meta", "title", "placeholder", "decor", "kicker")]
+    return sum(
+        prev.role in ("p", "text") and len(words(prev.text)) <= 4 and not prev.text.rstrip().endswith(".")
+        and nxt.role in ("h1", "h2", "h3")
+        for prev, nxt in zip(visible, visible[1:])
+    )
+
+
+def analyse(source: str, blocks: list[Block], info: dict, locked: tuple[str, ...] = ()) -> dict:
+    keys = [k.casefold() for k in locked if k.strip()]
+    is_locked = [any(k in b.text.casefold() for k in keys) for b in blocks]
+    findings = [f for b, skip in zip(blocks, is_locked) if not skip for f in check_block(b)]
+    if sum(f.check == "colon" for f in findings) < 2:  # one setup on a page is a sentence, not a habit
+        findings = [f for f in findings if f.check != "colon"]
     running = [b for b in blocks if _is_running(b)]
     lengths = [len(words(s)) for b in running for s in sentences(b.text)]
     heads = [b for b in blocks if b.role in ("h1", "h2", "h3")]
@@ -769,6 +798,7 @@ def analyse(source: str, blocks: list[Block], info: dict) -> dict:
         "lang": info.get("lang", ""),
         "body_words": sum(len(words(b.text)) for b in running),
         "rhythm": rhythm([n for n in lengths if n]),
+        "locked_blocks": sum(is_locked),
         "findings": [asdict(f) for f in findings],
         "repeats": repeats(blocks),
         "headings": {
@@ -776,6 +806,7 @@ def analyse(source: str, blocks: list[Block], info: dict) -> dict:
             "ending_in_full_stop": [b.text for b in heads if b.text.rstrip().endswith(".")],
             "set_over_lines": [b.text for b in heads if b.splits],
             "numbered_kickers": info.get("kickers", 0),
+            "eyebrows": _eyebrows(blocks),
         },
     }
 
@@ -835,6 +866,8 @@ def render_scan(report: dict) -> str:
         shape.append(f"{len(h['set_over_lines'])} are set over two or more lines")
     if h["numbered_kickers"] >= 3:
         shape.append(f"{h['numbered_kickers']} numbered section kickers (01, 02, ...)")
+    if h["eyebrows"] >= 3:
+        shape.append(f"{h['eyebrows']} have an eyebrow label above them")
     if shape:
         lines.append(
             "\nheading shape: " + "; ".join(shape) + ". When every section has the same shape the page "
@@ -848,6 +881,9 @@ def render_scan(report: dict) -> str:
         )
         if r["note"]:
             lines.append("  " + RHYTHM_NOTES[r["note"]])
+
+    if report["locked_blocks"]:
+        lines.append(f"\nlocked: {report['locked_blocks']} blocks match --locked and were not checked.")
 
     if not report["findings"] and not rep and not shape and not r.get("note"):
         lines.append("\nNo flags. That proves little: read it aloud against the three tests.")
@@ -868,9 +904,19 @@ def main(argv: list[str] | None = None) -> int:
         command = commands.add_parser(name, help=help_text)
         command.add_argument("inputs", nargs="+", help="HTML file, directory, URL, JSON catalog, or .txt/.md draft")
         command.add_argument("--json", action="store_true", help="machine-readable output")
+        command.add_argument(
+            "--locked", action="append", default=[], metavar="FILE",
+            help="lines kept word for word, one substring per line; matching blocks are not flagged",
+        )
     args = parser.parse_args(argv)
 
     try:
+        locked = tuple(
+            line.strip()
+            for name in args.locked
+            for line in Path(name).read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
         pages = [page for target in args.inputs for page in load(target)]
     except (OSError, ValueError) as exc:  # missing file, unreachable URL, malformed JSON
         print(f"copy_audit: {exc}", file=sys.stderr)
@@ -887,7 +933,7 @@ def main(argv: list[str] | None = None) -> int:
             print("\n\n".join(render_extract(*page) for page in pages))
         return 0
 
-    reports = [analyse(*page) for page in pages]
+    reports = [analyse(*page, locked=locked) for page in pages]
     if args.json:
         print(json.dumps(reports, ensure_ascii=False, indent=1))
     else:

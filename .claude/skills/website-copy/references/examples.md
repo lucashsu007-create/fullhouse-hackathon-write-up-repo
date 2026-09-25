@@ -3,7 +3,12 @@
 Real lines from three sites built with AI help, and what they became. Names are
 replaced with [brackets]; the patterns are the point. Every "after" uses only
 facts that were already on the page. Where a line is locked (legal, regulatory,
-a required disclosure), the "after" is a proposal for the owner and says so.
+a required disclosure), or the change reaches past the words into the layout,
+the "after" is a proposal for the owner and says so.
+
+These show a method, not lines to reuse. Before borrowing any "after", check it
+against the whole page you're working on: the same words can repeat a line
+nearby (a placeholder, an hours strip) or say more than your sources do.
 
 The three sites:
 
@@ -81,12 +86,14 @@ does.
 
 > Before: No firm is named here, and both sides are checked.
 >
-> After: Names stay private. We only share them once both sides have agreed to
-> an introduction.
+> After: We don't pass on your name until both sides have agreed to an
+> introduction.
 
 Why: the old line answers a reviewer's question, "why no client logos?". The
 visitor's question is "will my name be passed around?". The new line comes
-from the project's own notes, so it adds no claim.
+from the project's own notes, so it adds no claim. It says *your* name on
+purpose: "we keep our clients' names private" would imply clients the firm
+can't name, which its notes rule out.
 
 **A disclosure that sounds defensive** (sushi restaurant, footer; a required
 disclosure, so this is a proposal)
@@ -101,20 +108,28 @@ Why: one calm sentence says which images are AI and where they came from. "De
 foto's zijn echt" answers an accusation nobody made. Whoever signed off the
 disclosure decides.
 
-**A checklist as copy** (advisory, "How we check": ten criteria, two marked
-"Gate", and a "We stop when" list)
+**A checklist as copy** (advisory, "How we check": ten criteria in two
+columns, two marked "Gate" in the accent colour, and a "We stop when" list)
 
-> After: Two things are non-negotiable for a project: a signed grid connection
-> agreement, and land secured for longer than the asset will run. Beyond that
-> we look at whether the costs hold up against benchmarks and whether every
-> revenue figure traces back to a published source. Investors are checked too.
-> They need to show that they can fund the deal, and where the money comes
-> from. We walk away if a number can't be traced, or if an investor can't show
-> the money.
+The two columns and their Gate markers are the page's central design, so the
+copy pass stays inside them.
 
-Why: a published checklist reads like an audit. Naming the checks that matter
-shows the same care in sentences, and the full list is for the conversation.
-Every claim in the new version is already on the page.
+> Before (the stop list): a seller keeps both the build and the operations; a
+> number cannot be traced to a source; an investor cannot evidence the money.
+>
+> After, copy only: a seller wants to keep both the build and the operations; a
+> number can't be traced to a source; an investor can't show where the money
+> comes from.
+
+> Proposed as a design question, since it removes the list: Two things are
+> non-negotiable for a project. It needs a signed grid connection agreement,
+> and land secured for longer than the asset will run. Beyond that we check
+> that the costs hold up against benchmarks and that every revenue figure
+> traces back to a published source.
+
+Why: plain verbs fix the stop list without touching the layout. The prose
+version reads better to some owners and worse to readers who scan criteria for
+a living, so it is theirs to choose.
 
 ## Written to a template
 
@@ -124,31 +139,41 @@ Every claim in the new version is already on the page.
 > verrassingen. Van sushi en sashimi tot gerechten met een eigen
 > [naam]-twist.
 >
-> After: Al sinds 2010 eet je bij ons sushi, sashimi en gerechten uit Japan,
-> China, Thailand en Korea. We zijn elke dag open vanaf 17:00.
+> After: Van sushi en sashimi tot hoofdgerechten, met de smaken van Japan,
+> China, Thailand en Korea.
 
 Why: "smaak, vuur en verrassingen" is true of any restaurant (swap test), and
-"met gevoel" and "eigen twist" are stock. The founding year, the kitchens and
-the hours are true, specific and useful.
+"met gevoel" and "eigen twist" are stock. What the kitchen serves, in the page's
+own words, is true and specific. The founding year and the hours stay out:
+the strip right above the hero already shows them.
+
+**The mistake the first version of this file made.** Its "after" for this hero
+said "gerechten uit Japan, China, Thailand en Korea". The page says "de smaken
+van" (the flavours of), and none of the fifteen dishes on the menu is Korean.
+One rephrase turned a true line into a false claim. Keep the source's exact
+meaning, not just its words.
 
 > Before: [Naam] brengt de smaken van Japan, China, Thailand en Korea samen in
 > een warme setting. Kom voor de sushi, blijf voor de sfeer.
 >
-> After: Je zit aan tafel bij het raam, of in de lounge bij het open vuur.
+> After: [Naam] brengt de smaken van Japan, China, Thailand en Korea samen.
+> Er zijn tafels aan het raam, en in de lounge brandt een open vuur.
 
 Why: "kom voor X, blijf voor Y" is one of the most used restaurant slogans
-there is. The window tables and the open fire are in the photos, so they're
-true, and nobody else can say them.
+there is. The window tables and the fire are in the page's own photos, so they
+are true, and nobody else can say them. Say what is there, not what guests may
+do: no source says you can pick your seat or eat in the lounge.
 
 **The same slogans in English** (same site, English toggle)
 
 > Before: Asian fusion, with feeling. Come for the sushi, stay for the mood.
 >
-> After: Asian fusion since 2010: sushi, sashimi and dishes from Japan, China,
-> Thailand and Korea. Open every day from 17:00.
+> After: Sushi, sashimi and main courses with the flavours of Japan, China,
+> Thailand and Korea.
 
-Why: a slogan translated line by line is worse than the original. English
-readers are often visitors, so the practical line comes first.
+Why: a slogan translated line by line is worse than the original. Write the
+English line natively from the same facts, and let the page's hours strip do
+its job.
 
 **Headings in one shape** (Asian fusion restaurant)
 
@@ -185,21 +210,24 @@ dan honderd" was also said twice.
 
 > Before: [Name] / CEO / She runs the screen herself.
 >
-> After: [Name], our CEO, checks the projects and the investors herself.
+> After: [Name] / CEO / She checks the projects and the investors herself.
 
-Why: "the screen" is internal shorthand, and nobody talks in that fragment. The
-new line says the same thing the way a person would.
+Why: "the screen" is internal shorthand; the new note says the same thing in
+the reader's words. Only the note changes. Folding name, title and note into one
+sentence would read better still, but the name card is layout, so that is a
+design question.
 
 **Curt instructions** (advisory, contact)
 
 > Before: Tell us which side you are on. Keep the first message short and
 > non-confidential.
 >
-> After: Let us know whether you have a project or represent investors. A few
-> lines is enough for a first message, and please leave out anything
-> confidential.
+> After: Tell us about your project, or what you're looking to invest in, and
+> please leave anything confidential out of this first message.
 
 Why: the same content, but it sounds like someone who wants to hear from you.
+It doesn't ask which side you're on, because the form's tabs already do, or say
+"a few lines is enough", because the message box's placeholder already does.
 
 **Translated word order** (sushi restaurant)
 
